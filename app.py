@@ -101,7 +101,6 @@ class FluentDACController(FluentWindow):
         info_card = CardWidget(self)
         info_l = QGridLayout(info_card)
         
-        # Init labels as loading
         self.lbl_man = BodyLabel("Manufacturer: Loading...", info_card)
         self.lbl_prod = BodyLabel("Product: Loading...", info_card)
         self.lbl_fw = BodyLabel(f"Firmware: {self.hw_info['FW']}", info_card)
@@ -170,7 +169,11 @@ class FluentDACController(FluentWindow):
         self.pre_slider.setRange(-120, 120); self.pre_slider.setValue(int(active_p["preamp"] * 10))
         self.preamp_val = LineEdit(pre_card)
         self.preamp_val.setText(str(active_p["preamp"])); self.preamp_val.setFixedWidth(65)
+        
+        # Preamp Connections
         self.pre_slider.valueChanged.connect(lambda v: [self.preamp_val.setText(str(v/10)), self._apply_filter(-1)])
+        self.preamp_val.editingFinished.connect(lambda: self.pre_slider.setValue(int(float(self.preamp_val.text().replace(',', '.') or 0) * 10)))
+
         pre_l.addWidget(self.pre_slider, 1); pre_l.addWidget(self.preamp_val); pre_l.addWidget(CaptionLabel("dB", pre_card))
         header_l.addWidget(pre_card); eq_layout.addWidget(header_frame)
 
@@ -199,37 +202,33 @@ class FluentDACController(FluentWindow):
             qv = LineEdit(band_card); qv.setText(str(f_cfg["q"])); qv.setFixedWidth(55)
             bl.addSpacing(15); bl.addWidget(CaptionLabel("Q:", band_card)); bl.addWidget(qv)
             
+            # --- BAND LOGIC ---
+            # Connect Checkbox and Type Dropdown
             chk.stateChanged.connect(lambda _, idx=i: self._apply_filter(idx))
+            typ.currentIndexChanged.connect(lambda _, idx=i: self._apply_filter(idx))
+            
+            # Slider updates Text and applies to Hardware
             sld.valueChanged.connect(lambda v, idx=i, le=gain: [le.setText(str(v/10)), self._apply_filter(idx)])
+            
+            # Textboxes update Hardware (or update Slider to trigger Hardware)
+            gain.editingFinished.connect(lambda s=sld, le=gain: s.setValue(int(float(le.text().replace(',', '.') or 0) * 10)))
+            freq.editingFinished.connect(lambda idx=i: self._apply_filter(idx))
+            qv.editingFinished.connect(lambda idx=i: self._apply_filter(idx))
             
             self.filter_widgets.append({"enabled": chk, "type": typ, "freq": freq, "gain": gain, "q": qv, "slider": sld})
             self.bands_layout.addWidget(band_card)
-        scroll.setWidget(container); eq_layout.addWidget(scroll)
 
-        # Lock UI initially
+        scroll.setWidget(container); eq_layout.addWidget(scroll)
         self.toggle_controls(False)
 
     def toggle_controls(self, enabled):
-        """Locks or unlocks the interactive elements."""
-        self.bal_slider.setEnabled(enabled)
-        self.cb_filter.setEnabled(enabled)
-        self.cb_gain.setEnabled(enabled)
-        self.cb_amp.setEnabled(enabled)
-        
-        self.preset_cb.setEnabled(enabled)
-        self.pre_slider.setEnabled(enabled)
-        self.preamp_val.setEnabled(enabled)
-        self.btn_add.setEnabled(enabled)
-        self.btn_reset.setEnabled(enabled)
-        self.btn_import.setEnabled(enabled)
-        
+        self.bal_slider.setEnabled(enabled); self.cb_filter.setEnabled(enabled)
+        self.cb_gain.setEnabled(enabled); self.cb_amp.setEnabled(enabled)
+        self.preset_cb.setEnabled(enabled); self.pre_slider.setEnabled(enabled)
+        self.preamp_val.setEnabled(enabled); self.btn_add.setEnabled(enabled)
+        self.btn_reset.setEnabled(enabled); self.btn_import.setEnabled(enabled)
         for w in self.filter_widgets:
-            w["enabled"].setEnabled(enabled)
-            w["type"].setEnabled(enabled)
-            w["freq"].setEnabled(enabled)
-            w["gain"].setEnabled(enabled)
-            w["q"].setEnabled(enabled)
-            w["slider"].setEnabled(enabled)
+            for k in w: w[k].setEnabled(enabled)
 
     def _create_row(self, layout, title, mapping, cmd):
         card = CardWidget(self); l = QHBoxLayout(card)
@@ -248,10 +247,7 @@ class FluentDACController(FluentWindow):
     def refresh(self):
         if self.is_syncing: return
         self.is_syncing, self.read_results, self.parsed_filters = True, {}, {}
-        
-        self.refresh_status_lbl_dac.setText("refreshing...")
-        self.refresh_status_lbl_eq.setText("refreshing...")
-        
+        self.refresh_status_lbl_dac.setText("refreshing..."); self.refresh_status_lbl_eq.setText("refreshing...")
         def run():
             dev = self.get_device()
             if not dev: 
@@ -261,16 +257,12 @@ class FluentDACController(FluentWindow):
                 info = {"SN": dev.serial_number, "FW": "Loading..."}
                 dev.open(); dev.set_raw_data_handler(self.on_data)
                 for cmd in [CMD_VERSION, 0x11, 0x19, 0x1D, CMD_GLOBAL_GAIN]:
-                    dev.find_output_reports()[0].send([REPORT_ID, READ, cmd, END] + [0x00]*60)
-                    time.sleep(0.05)
+                    dev.find_output_reports()[0].send([REPORT_ID, READ, cmd, END] + [0x00]*60); time.sleep(0.05)
                 for i in range(10):
-                    dev.find_output_reports()[0].send([REPORT_ID, READ, CMD_PEQ_VALUES, 0x00, 0x00, i, END] + [0x00]*57)
-                    time.sleep(0.05)
+                    dev.find_output_reports()[0].send([REPORT_ID, READ, CMD_PEQ_VALUES, 0x00, 0x00, i, END] + [0x00]*57); time.sleep(0.05)
                 time.sleep(0.5); dev.close()
                 self.comm.sync_finished.emit(info, self.read_results, self.parsed_filters)
-            except Exception as e: 
-                self.comm.status_msg.emit("Sync Error")
-            finally: self.is_syncing = False
+            except: self.is_syncing = False
         Thread(target=run, daemon=True).start()
 
     def on_data(self, data):
@@ -281,55 +273,34 @@ class FluentDACController(FluentWindow):
                 self.hw_info["FW"] = raw.decode('ascii', errors='ignore').strip() or "Unknown"
             elif cmd == CMD_PEQ_VALUES and len(data) >= 35:
                 idx = data[5] 
-                freq = data[28] | (data[29] << 8)
-                q_raw = data[30] | (data[31] << 8)
-                q = round(q_raw / 256.0, 2)
-                gain_raw = data[32] | (data[33] << 8)
-                if gain_raw > 32767: gain_raw -= 65536
-                gain = round(gain_raw / 256.0, 1)
-                f_type = INV_TYPE_CODES.get(data[34], "PK")
-                if freq > 0:
-                    self.parsed_filters[idx] = {"freq": freq, "q": q, "gain": gain, "type": f_type}
-            elif cmd == CMD_GLOBAL_GAIN:
-                self.read_results[cmd] = struct.unpack("b", bytes([data[4]]))[0]
+                f_raw = data[28] | (data[29] << 8)
+                q = round((data[30] | (data[31] << 8)) / 256.0, 2)
+                g_raw = data[32] | (data[33] << 8)
+                if g_raw > 32767: g_raw -= 65536
+                self.parsed_filters[idx] = {"freq": f_raw, "q": q, "gain": round(g_raw / 256.0, 1), "type": INV_TYPE_CODES.get(data[34], "PK")}
+            elif cmd == CMD_GLOBAL_GAIN: self.read_results[cmd] = struct.unpack("b", bytes([data[4]]))[0]
             else: self.read_results[cmd] = data[4]
 
     def _connect_logic(self):
         self.comm.sync_finished.connect(self.update_ui_state)
-        self.comm.status_msg.connect(lambda m: [
-            InfoBar.error("Status", m, duration=2000, parent=self),
-            self.refresh_status_lbl_dac.setText(""),
-            self.refresh_status_lbl_eq.setText(""),
-            self.toggle_controls(False),
-            self.lbl_man.setText("Manufacturer: Loading..."),
-            self.lbl_prod.setText("Product: Loading..."),
-            self.lbl_sn.setText("Serial: Loading..."),
-            self.lbl_fw.setText("Firmware: Loading...")
-        ])
+        self.comm.status_msg.connect(lambda m: [InfoBar.error("Status", m, duration=2000, parent=self), self.toggle_controls(False)])
 
     def update_ui_state(self, info, results, filters):
+        self.is_syncing = True 
         sn = info.get('SN', '')
-        
-        # Check if device is recognized before unlocking UI
-        if sn and sn != "Loading...":
-            self.lbl_man.setText("Manufacturer: TRN")
-            self.lbl_prod.setText("Product: Black Pearl(TE-C)")
-            self.lbl_sn.setText(f"Serial: {sn}")
-            self.lbl_fw.setText(f"Firmware: {self.hw_info['FW']}")
+        if sn:
+            self.lbl_man.setText("Manufacturer: TRN"); self.lbl_prod.setText("Product: Black Pearl(TE-C)")
+            self.lbl_sn.setText(f"Serial: {sn}"); self.lbl_fw.setText(f"Firmware: {self.hw_info['FW']}")
             self.toggle_controls(True)
-        else:
-            self.lbl_man.setText("Manufacturer: Loading...")
-            self.lbl_prod.setText("Product: Loading...")
-            self.lbl_sn.setText("Serial: Loading...")
-            self.lbl_fw.setText("Firmware: Loading...")
-            self.toggle_controls(False)
-
+        
         mapping = {0x11: (self.cb_filter, FILTER_MAP), 0x19: (self.cb_gain, GAIN_MAP), 0x1D: (self.cb_amp, AMP_MAP)}
         for cmd, (widget, n_map) in mapping.items():
             if cmd in results: widget.setCurrentText(n_map.get(results[cmd], "Unknown"))
+        
         if CMD_GLOBAL_GAIN in results:
-            preamp = results[CMD_GLOBAL_GAIN]
-            self.preamp_val.setText(str(preamp)); self.pre_slider.setValue(int(preamp * 10))
+            p = results[CMD_GLOBAL_GAIN]
+            self.preamp_val.setText(str(p)); self.pre_slider.setValue(int(p * 10))
+        
         for idx, f in filters.items():
             if idx < len(self.filter_widgets):
                 w = self.filter_widgets[idx]
@@ -337,43 +308,8 @@ class FluentDACController(FluentWindow):
                 w["gain"].setText(str(f["gain"])); w["slider"].setValue(int(f["gain"] * 10))
                 w["type"].setCurrentText(f["type"])
 
-        QTimer.singleShot(3000, lambda: [
-            self.refresh_status_lbl_dac.setText(""),
-            self.refresh_status_lbl_eq.setText("")
-        ])
-
-    def _reset_eq(self):
-        # Temporarily block apply to avoid 11 consecutive USB writes
-        self.is_syncing = True 
-        
-        # Reset Preamp
-        self.preamp_val.setText("0.0")
-        self.pre_slider.setValue(0)
-        
-        # Reset all 10 bands
-        for w in self.filter_widgets:
-            w["gain"].setText("0.0")
-            w["slider"].setValue(0)
-            w["enabled"].setChecked(True)
-            # Optional: Reset Q and Type to defaults if you want a true "Flat"
-            w["q"].setText("1.0")
-            w["type"].setCurrentText("PK")
-            
+        QTimer.singleShot(3000, lambda: [self.refresh_status_lbl_dac.setText(""), self.refresh_status_lbl_eq.setText("")])
         self.is_syncing = False
-        
-        # Push the changes to the hardware in one batch
-        # -1 updates Preamp, 0-9 updates the bands
-        for i in range(-1, 10): 
-            self._apply_filter(i)
-            
-        InfoBar.success("EQ Reset", "All gains set to 0.0dB", duration=1500, parent=self)
-        self.is_syncing = True
-        self.preamp_val.setText("0.0"); self.pre_slider.setValue(0)
-        for w in self.filter_widgets:
-            w["gain"].setText("0.0"); w["slider"].setValue(0); w["enabled"].setChecked(True)
-        self.is_syncing = False
-        for i in range(-1, 10): self._apply_filter(i)
-        InfoBar.success("EQ Reset", "Flat preset applied", duration=1500, parent=self)
 
     def _apply_filter(self, idx):
         if self.is_syncing: return
@@ -383,17 +319,18 @@ class FluentDACController(FluentWindow):
             dev.open(); report = dev.find_output_reports()[0]
             if idx >= 0:
                 w = self.filter_widgets[idx]
-                gain = 0.0 if not w["enabled"].isChecked() else float(w["gain"].text() or 0)
-                f = max(1, int(w["freq"].text() or 100))
-                q = max(0.01, float(w["q"].text() or 1.0))
+                gain = 0.0 if not w["enabled"].isChecked() else float(w["gain"].text().replace(',', '.') or 0)
+                f = max(1, int(float(w["freq"].text().replace(',', '.') or 100)))
+                q = max(0.01, float(w["q"].text().replace(',', '.') or 1.0))
                 f_type = w["type"].currentText()
                 coeffs = self._calculate_biquad(f_type, f, q, gain)
-                pkt = [WRITE, CMD_PEQ_VALUES, 0x18, 0x00, idx, 0x00, 0x00] + list(coeffs)
+                pkt = [WRITE, CMD_PEQ_VALUES, 0x20, 0x00, idx, 0x00, 0x00] + list(coeffs)
                 pkt += list(struct.pack("<H", f)) + list(struct.pack("<H", int(q*256))) + list(struct.pack("<h", int(gain*256)))
                 pkt += [TYPE_CODES.get(f_type, 0x02), 0x00, 0x00, END]
                 report.send([REPORT_ID] + pkt + ([0x00] * (63 - len(pkt))))
             else:
-                report.send([REPORT_ID, WRITE, CMD_GLOBAL_GAIN, 0x02, 0x00, int(float(self.preamp_val.text() or 0)) & 0xFF] + [0x00]*58)
+                p_val = int(float(self.preamp_val.text().replace(',', '.') or 0)) & 0xFF
+                report.send([REPORT_ID, WRITE, CMD_GLOBAL_GAIN, 0x02, 0x00, p_val] + [0x00]*58)
             report.send([REPORT_ID, WRITE, CMD_TEMP_WRITE, 0x04, 0x00, 0x00, 0xFF, 0xFF, END] + [0x00]*55)
             report.send([REPORT_ID, WRITE, CMD_FLASH_EQ, 0x01, END] + [0x00]*59)
             dev.close(); self.save_settings()
@@ -423,15 +360,44 @@ class FluentDACController(FluentWindow):
                 dev.close(); self.save_settings()
             except: pass
 
-    def _load_preset_ui(self):
+    def _batch_push_current_eq(self):
         self.is_syncing = True
+        def run():
+            dev = self.get_device()
+            if dev:
+                try:
+                    dev.open(); report = dev.find_output_reports()[0]
+                    p_val = int(float(self.preamp_val.text().replace(',', '.') or 0)) & 0xFF
+                    report.send([REPORT_ID, WRITE, CMD_GLOBAL_GAIN, 0x02, 0x00, p_val] + [0x00]*58); time.sleep(0.02)
+                    for idx, w in enumerate(self.filter_widgets):
+                        gain = 0.0 if not w["enabled"].isChecked() else float(w["gain"].text().replace(',', '.') or 0)
+                        f = max(1, int(float(w["freq"].text().replace(',', '.') or 100)))
+                        q = max(0.01, float(w["q"].text().replace(',', '.') or 1.0))
+                        f_type = w["type"].currentText()
+                        coeffs = self._calculate_biquad(f_type, f, q, gain)
+                        pkt = [WRITE, CMD_PEQ_VALUES, 0x20, 0x00, idx, 0x00, 0x00] + list(coeffs)
+                        pkt += list(struct.pack("<H", f)) + list(struct.pack("<H", int(q*256))) + list(struct.pack("<h", int(gain*256)))
+                        pkt += [TYPE_CODES.get(f_type, 0x02), 0x00, 0x00, END]
+                        report.send([REPORT_ID] + pkt + ([0x00] * (63 - len(pkt)))); time.sleep(0.02)
+                    report.send([REPORT_ID, WRITE, CMD_TEMP_WRITE, 0x04, 0x00, 0x00, 0xFF, 0xFF, END] + [0x00]*55); time.sleep(0.02)
+                    report.send([REPORT_ID, WRITE, CMD_FLASH_EQ, 0x01, END] + [0x00]*59); dev.close()
+                except: pass
+            self.is_syncing = False; self.save_settings()
+        Thread(target=run, daemon=True).start()
+
+    def _reset_eq(self):
+        self.preamp_val.setText("0.0"); self.pre_slider.setValue(0)
+        for w in self.filter_widgets:
+            w["gain"].setText("0.0"); w["slider"].setValue(0); w["enabled"].setChecked(True); w["q"].setText("1.0"); w["type"].setCurrentText("PK")
+        self._batch_push_current_eq(); InfoBar.success("EQ Reset", "Flat preset applied", duration=1500, parent=self)
+
+    def _load_preset_ui(self):
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
         self.preamp_val.setText(str(p["preamp"])); self.pre_slider.setValue(int(p["preamp"] * 10))
         for i, f in enumerate(p["filters"]):
             w = self.filter_widgets[i]; w["enabled"].setChecked(f["enabled"]); w["type"].setCurrentText(f["type"])
             w["freq"].setText(str(f["freq"])); w["gain"].setText(str(f["gain"])); w["q"].setText(str(f["q"])); w["slider"].setValue(int(f["gain"] * 10))
-        self.is_syncing = False
-        for i in range(-1, 10): self._apply_filter(i)
+        self._batch_push_current_eq()
 
     def _import_squig(self):
         from PySide6.QtWidgets import QFileDialog
@@ -439,11 +405,11 @@ class FluentDACController(FluentWindow):
         if not path: return
         try:
             with open(path, 'r') as f: lines = f.readlines()
-            self.is_syncing = True; idx = 0
+            idx = 0
             for line in lines:
                 if "Preamp:" in line:
                     m = re.search(r"Preamp:\s*([-+]?[\d.]+)", line)
-                    if m: self.preamp_val.setText(m.group(1))
+                    if m: self.preamp_val.setText(m.group(1)); self.pre_slider.setValue(int(float(m.group(1))*10))
                 if "Filter" in line and idx < 10:
                     w = self.filter_widgets[idx]; w["enabled"].setChecked("ON" in line)
                     w["type"].setCurrentText("PK" if " PK " in line else "LS" if " LS " in line else "HS")
@@ -452,9 +418,8 @@ class FluentDACController(FluentWindow):
                     if gn: [w["gain"].setText(gn.group(1)), w["slider"].setValue(int(float(gn.group(1)) * 10))]
                     if qv: w["q"].setText(qv.group(1))
                     idx += 1
-            self.is_syncing = False
-            for i in range(-1, 10): self._apply_filter(i)
-        except: self.is_syncing = False
+            self._batch_push_current_eq()
+        except: pass
 
     def _new_preset(self):
         from PySide6.QtWidgets import QInputDialog
@@ -468,8 +433,7 @@ class FluentDACController(FluentWindow):
         dev = self.get_device()
         if dev:
             try:
-                inv = {v: k for k, v in n_map.items()}
-                val = inv.get(selection)
+                val = {v: k for k, v in n_map.items()}.get(selection)
                 dev.open(); dev.find_output_reports()[0].send([REPORT_ID, WRITE, cmd, 0x01, val] + [0x00]*59); dev.close()
             except: pass
 
@@ -477,12 +441,12 @@ class FluentDACController(FluentWindow):
         idx = self.preset_cb.currentIndex()
         if idx >= 0:
             current = self.settings_data["presets"][idx]
-            current["preamp"] = float(self.preamp_val.text() or 0)
+            current["preamp"] = float(self.preamp_val.text().replace(',', '.') or 0)
             current["filters"] = []
             for w in self.filter_widgets:
                 current["filters"].append({
-                    "type": w["type"].currentText(), "freq": int(w["freq"].text() or 0),
-                    "gain": float(w["gain"].text() or 0), "q": float(w["q"].text() or 1),
+                    "type": w["type"].currentText(), "freq": int(float(w["freq"].text().replace(',', '.') or 0)),
+                    "gain": float(w["gain"].text().replace(',', '.') or 0), "q": float(w["q"].text().replace(',', '.') or 1),
                     "enabled": w["enabled"].isChecked()
                 })
             self.settings_data["last_preset"] = idx
@@ -491,5 +455,6 @@ class FluentDACController(FluentWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = FluentDACController(); window.show()
+    window = FluentDACController()
+    window.show()
     sys.exit(app.exec())
