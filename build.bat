@@ -7,7 +7,7 @@ if not exist venv (
 call venv\Scripts\activate
 
 echo Building EXE...
-pyinstaller --noconsole --onefile --icon=icon.ico --add-data "icon.jpg;." app.py
+pyinstaller --noconfirm --onefile --windowed --add-data "icon.ico;." --icon "icon.ico" app.py
 
 echo.
 echo Build finished! Check the 'dist' folder for your executable.
