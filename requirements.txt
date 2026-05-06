@@ -1,2 +1,4 @@
-sv_ttk
-pywinusb
+pywinusb 
+PySide6
+PySide6-Fluent-Widgets 
+pyinstaller
