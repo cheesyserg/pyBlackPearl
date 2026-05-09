@@ -284,6 +284,7 @@ class EQGraph(QWidget):
 
     # --- Mouse Events ---
     def mousePressEvent(self, event):
+        if not self.isEnabled(): return # <--- Fix: Ignore input if disabled
         x, y = event.position().x(), event.position().y()
         for key, (rx, ry, rw, rh) in self.legend_rects.items():
             if rx <= x <= rx + rw and ry <= y <= ry + rh:
@@ -307,6 +308,7 @@ class EQGraph(QWidget):
             self.update()
 
     def mouseMoveEvent(self, event):
+        if not self.isEnabled(): return
         if self.dragging_idx != -1:
             x, y = event.position().x(), event.position().y()
             f = self.filters[self.dragging_idx]
@@ -321,6 +323,7 @@ class EQGraph(QWidget):
         self.dragging_idx = -1
 
     def wheelEvent(self, event):
+        if not self.isEnabled(): return
         if self.active_idx != -1 and self.visibility.get("eq", True):
             f = self.filters[self.active_idx]
             if not f.get("lock_q", False):
@@ -1100,10 +1103,12 @@ class FluentDACController(FluentWindow):
     def toggle_controls(self, enabled):
         objs = [self.vol_slider, self.eq_vol_slider, self.bal_slider, self.cb_filter, 
                 self.cb_gain, self.cb_amp, self.preset_cb, 
-                self.btn_reset, self.btn_add,
+                self.btn_reset, self.btn_add, self.btn_import_meas, self.btn_import_target,
+                self.btn_import, self.btn_export, self.graph, self.small_graph,
+                self.btn_toggle_view, self.active_band_card,
                 self.band_enable, self.band_type, self.band_freq, self.band_gain_sld, 
                 self.band_gain_val, self.band_q_val, self.lock_freq, self.lock_gain, self.lock_q,
-                self.btn_factory_reset]
+                self.btn_factory_reset, self.mic_slider]
         for o in objs: o.setEnabled(enabled)
         for lw in self.list_widgets:
             for k, w in lw.items(): w.setEnabled(enabled)
@@ -1172,9 +1177,13 @@ class FluentDACController(FluentWindow):
                     return
                 try:
                     report = dev.find_output_reports()[0]
-                    for cmd in [CMD_VERSION, 0x11, 0x19, 0x1D, CMD_GLOBAL_GAIN, 0x02]:
+                    for cmd in [CMD_VERSION, 0x11, 0x19, 0x1D, CMD_GLOBAL_GAIN, 0x02, "BAL_L", "BAL_R"]:
                         if cmd == 0x02:
                             report.send([REPORT_ID, READ, 0x02, 0x02] + [0x00]*60)
+                        elif cmd == "BAL_L":
+                            report.send([REPORT_ID, READ, 0x16, 0x04, 0x01, 0x00, 0x00] + [0x00]*57)
+                        elif cmd == "BAL_R":
+                            report.send([REPORT_ID, READ, 0x16, 0x04, 0x00, 0x00, 0x00] + [0x00]*57)
                         else:
                             report.send([REPORT_ID, READ, cmd, END] + [0x00]*60)
                         time.sleep(0.06)
@@ -1206,6 +1215,12 @@ class FluentDACController(FluentWindow):
                     self.last_raw_vol = raw_vol
                 elif raw_vol != getattr(self, 'last_raw_vol', 0) and not getattr(self, '_updating_ui', False):
                     self.comm.hw_vol_changed.emit(raw_vol)
+            elif cmd == 0x16: # <--- New Balance Logic
+                sf, mag = data[4], data[6]
+                if sf == 0x01: 
+                    self.read_results["bal_l"] = (mag - 256) if mag > 0 else 0
+                else: 
+                    self.read_results["bal_r"] = (256 - mag) if mag > 0 else 0
             # Parse Mic Gain response: 4b 80 02 02
             elif cmd == 0x02 and data[3] == 0x02:
                 self.read_results["mic_gain"] = struct.unpack('b', bytes([data[5]]))[0]
@@ -1230,6 +1245,20 @@ class FluentDACController(FluentWindow):
         self.lbl_sn.setText(f"Serial: {'********' if self.sn_hidden else self.actual_sn}")
         self.lbl_fw.setText(f"Firmware: {self.hw_info['FW']}"); self.toggle_controls(True)
         
+        # Consolidation Logic for Balance
+        # Better Consolidation: Choose the strongest offset and ignore hardware noise (+/- 1)
+        bal_l = results.get("bal_l", 0)
+        bal_r = results.get("bal_r", 0)
+        bal = bal_l if abs(bal_l) > abs(bal_r) else bal_r
+        
+        # Snap-to-Zero: If hardware reports a tiny offset of 1 (firmware bug), treat it as 0
+        if abs(bal) <= 1: bal = 0
+        
+        self._updating_ui = True
+        self.bal_slider.setValue(bal)
+        self.bal_txt.setText(f"L {abs(bal)}" if bal < 0 else f"R {bal}" if bal > 0 else "Center")
+        self._updating_ui = False
+
         self._check_headroom(auto_level=False)
         mapping = {0x11: (self.cb_filter, FILTER_MAP), 0x19: (self.cb_gain, GAIN_MAP), 0x1D: (self.cb_amp, AMP_MAP)}
         for cmd, (w, m) in mapping.items():
@@ -1340,8 +1369,19 @@ class FluentDACController(FluentWindow):
             dev = self.get_device()
             if dev:
                 try:
-                    sf, mag = (0x01, 256+v) if v<0 else (0x00, 256-v) if v>0 else (0x00, 0x00)
-                    dev.find_output_reports()[0].send([REPORT_ID, 0x01, 0x16, 0x04, sf, 0x00, mag] + [0x00]*57)
+                    report = dev.find_output_reports()[0]
+                    
+                    # 1. Calculate Magnitudes (0x00 clears the channel)
+                    mag_l = 256 + v if v < 0 else 0x00
+                    mag_r = 256 - v if v > 0 else 0x00
+                    
+                    # 2. Write Left Channel (Side Flag 0x01)
+                    report.send([REPORT_ID, 0x01, 0x16, 0x04, 0x01, 0x00, mag_l] + [0x00]*57)
+                    time.sleep(0.01) # Small delay so the DAC chips don't bottleneck
+                    
+                    # 3. Write Right Channel (Side Flag 0x00)
+                    report.send([REPORT_ID, 0x01, 0x16, 0x04, 0x00, 0x00, mag_r] + [0x00]*57)
+                    
                     self.save_settings()
                 except: pass
             
