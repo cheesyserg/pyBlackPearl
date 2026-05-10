@@ -409,7 +409,12 @@ class FluentDACController(FluentWindow):
         default_data = {"balance": 0, "last_preset": 0, "presets": [{"name": "Default", "preamp": 0.0, "filters": default_filters}]}
         if os.path.exists(SETTINGS_FILE):
             try:
-                with open(SETTINGS_FILE, "r") as f: return {**default_data, **json.load(f)}
+                with open(SETTINGS_FILE, "r") as f: 
+                    data = {**default_data, **json.load(f)}
+                    # FAIL-SAFE: Ensure the saved preset index actually exists
+                    if data.get("last_preset", 0) >= len(data.get("presets", [])):
+                        data["last_preset"] = 0
+                    return data
             except: pass
         return default_data
         
@@ -1272,10 +1277,7 @@ class FluentDACController(FluentWindow):
             p = self.settings_data["presets"][self.preset_cb.currentIndex()]
             p["preamp"] = float(g_val)
             self._updating_ui = False
-            
-        for idx, f in filters.items():
-            if idx < 10:
-                p["filters"][idx].update({"freq": f["freq"], "q": f["q"], "gain": f["gain"], "type": f["type"]})
+           
                 
         self._sync_all_uis()
         self.is_syncing = False; self.refresh_status_lbl_dac.setText("");
@@ -1286,6 +1288,11 @@ class FluentDACController(FluentWindow):
                     self.mic_slider.setValue(val)
                     self.mic_txt.setText(f"{val:+d} dB")
                     self._updating_ui = False
+        
+        if not hasattr(self, '_boot_sync_complete'):
+            self._boot_sync_complete = True
+            # The hardware is now ready. Force the PC's saved preset onto the DAC.
+            self._load_preset_ui()
 
     def _apply_filter(self, idx):
         if self.is_syncing: return
@@ -1479,7 +1486,17 @@ class FluentDACController(FluentWindow):
             InfoBar.error("Export Error", str(e), parent=self)
 
     def _load_preset_ui(self):
+        """
+        Triggered when the preset dropdown changes. 
+        Updates the UI elements, then explicitly flags all bands 
+        and global volume to be transmitted to the hardware.
+        """
         self._sync_all_uis()
+        if self.is_syncing:
+            return          
+        self._apply_filter(-1)
+        for i in range(10):
+            self._apply_filter(i)
 
     def write_val(self, cmd, selection, n_map):
         inv = {v: k for k, v in n_map.items()}
