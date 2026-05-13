@@ -22,6 +22,9 @@ from qfluentwidgets import (
     NavigationItemPosition
 )
 
+os.environ["QT_API"] = "pyside6"
+os.environ["QSG_RHI_BACKEND"] = "vulkan"
+
 def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
@@ -128,6 +131,11 @@ class EQGraph(QWidget):
         self.filters = filters
         self.active_idx = active_idx
         self.preamp = preamp
+        # Correctly cache coefficients so the screen doesn't lag
+        self.cached_coeffs = [
+            _calc_coeffs(f["type"], f["freq"], f["q"], f["gain"]) 
+            for f in self.filters if f.get("enabled", True)
+        ]
         self.update()
 
     # --- Math Helpers ---
@@ -141,21 +149,20 @@ class EQGraph(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
         
-        active_filters = [_calc_coeffs(f["type"], f["freq"], f["q"], f["gain"]) 
-                          for f in self.filters if f.get("enabled", True)]
-                          
+        # Use cached coefficients
         def get_eq_db(freq):
-            return self.preamp + sum(biquad_response(c, freq) for c in active_filters)
+            return self.preamp + sum(biquad_response(c, freq) for c in getattr(self, 'cached_coeffs', []))
 
         max_val = 18.0
 
-        # 1. Main EQ Line Math
+        # 1. Main EQ Line Math (Step increased to 5 for smoother performance)
         curve_points = []
-        step = 3 
+        step = 5 
         for x in range(0, w + step, step):
             freq = self._x_to_f(x)
             db_total = get_eq_db(freq)
-            curve_points.append((x, db_total))
+            # Pre-calculate Y coordinate once to save cycles later
+            curve_points.append((x, self._db_to_y(db_total))) 
             if self.visibility.get("eq", True): 
                 max_val = max(max_val, abs(db_total))
 
@@ -238,11 +245,12 @@ class EQGraph(QWidget):
         # Main EQ Curve & Control Points
         if self.visibility.get("eq", True):
             path = QPainterPath()
-            for i, (x, db) in enumerate(curve_points):
-                y = self._db_to_y(db)
+            # curve_points already contains the screen Y, so we use it directly
+            for i, (x, y) in enumerate(curve_points):
                 if i == 0: path.moveTo(x, y)
                 else: path.lineTo(x, y)
-                
+            
+            # Draw the path to the screen
             hy = int(self._db_to_y(self.headroom_db))
             painter.setPen(QPen(QColor(255, 165, 0, 200), 2, Qt.DashLine))
             painter.drawLine(0, hy, w, hy)
@@ -692,7 +700,7 @@ class FluentDACController(FluentWindow):
         bl.addWidget(self.lock_freq)
 
         self.band_gain_sld = Slider(Qt.Horizontal, self.active_band_card); self.band_gain_sld.setRange(-100, 100); bl.addWidget(self.band_gain_sld, 1)
-        self.band_gain_val = LineEdit(self.active_band_card); self.band_gain_val.setFixedWidth(45); bl.addWidget(self.band_gain_val); bl.addWidget(CaptionLabel("dB", self.active_band_card))
+        self.band_gain_val = LineEdit(self.active_band_card); self.band_gain_val.setFixedWidth(60); bl.addWidget(self.band_gain_val); bl.addWidget(CaptionLabel("dB", self.active_band_card))
         self.lock_gain = CheckBox("Lock", self.active_band_card)
         bl.addWidget(self.lock_gain)
 
@@ -752,7 +760,7 @@ class FluentDACController(FluentWindow):
             lbl_layout.addWidget(chk); lbl_layout.addWidget(typ); lbl_layout.addWidget(freq); lbl_layout.addWidget(CaptionLabel("Hz", band_card))
             
             sld, gain = Slider(Qt.Horizontal, band_card), LineEdit(band_card)
-            sld.setRange(-100, 100); gain.setFixedWidth(45)
+            sld.setRange(-100, 100); gain.setFixedWidth(60)
             
             lbl_layout.addWidget(sld, 1) # This expands to fill the middle space
             lbl_layout.addWidget(gain); lbl_layout.addWidget(CaptionLabel("dB", band_card))
@@ -1042,8 +1050,15 @@ class FluentDACController(FluentWindow):
         f["freq"] = max(20, min(20000, freq)) 
         f["gain"] = max(-10.0, min(10.0, gain))
         
-        # OPTIMIZATION: Only sync the 1 row being moved, not all 10
-        self._sync_all_uis(update_idx=idx)
+        # This tells the graph to re-cache and re-draw instantly
+        self.graph.update_data(p["filters"], self.active_band_idx, 0.0)
+        self.small_graph.update_data(p["filters"], self.active_band_idx, 0.0)
+        
+        if idx == self.active_band_idx:
+            self.band_freq.setText(str(int(f["freq"])))
+            self.band_gain_val.setText(str(round(f["gain"], 1)))
+            self.band_gain_sld.setValue(int(f["gain"] * 10))
+
         self._apply_filter(idx)
 
     def _on_graph_q_changed(self, idx, q):
