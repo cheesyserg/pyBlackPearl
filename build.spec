@@ -37,7 +37,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='TRN_Control_Panel',
+    name='TRN_Control_Panel_Driver',
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
