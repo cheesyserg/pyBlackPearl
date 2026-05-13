@@ -1,4 +1,4 @@
-pywinusb 
-PySide6
-PySide6-Fluent-Widgets 
+--index-url https://pypi.org/simple/
+PySide6-Fluent-Widgets
+pywinusb
 pyinstaller
