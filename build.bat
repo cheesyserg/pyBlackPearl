@@ -4,11 +4,14 @@ if not exist venv (
     pause
     exit /b
 )
+
+:: MANUALLY ADD THE STRIP PATH TO THIS SESSION
+:: Replace the path below with your actual MSYS2/MinGW bin folder
 call venv\Scripts\activate
 
 echo Building EXE...
-pyinstaller --noconfirm --onefile --windowed --add-data "icon.ico;." --icon "icon.ico" app.py
+pyinstaller --clean build.spec
 
 echo.
-echo Build finished! Check the 'dist' folder for your executable.
+echo Build finished!
 pause
