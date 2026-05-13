@@ -5,8 +5,6 @@ if not exist venv (
     exit /b
 )
 
-:: MANUALLY ADD THE STRIP PATH TO THIS SESSION
-:: Replace the path below with your actual MSYS2/MinGW bin folder
 call venv\Scripts\activate
 
 echo Building EXE...
