@@ -19,8 +19,9 @@ from qfluentwidgets import (
     ComboBox, Slider, LineEdit, CheckBox, CardWidget, InfoBar, 
     StrongBodyLabel, setTheme, Theme, FluentIcon, BodyLabel, 
     TransparentToolButton, SmoothScrollArea, SimpleCardWidget,
-    NavigationItemPosition
+    NavigationItemPosition, isDarkTheme, qconfig, setThemeColor
 )
+from qframelesswindow.utils import getSystemAccentColor
 
 os.environ["QT_API"] = "pyside6"
 os.environ["QSG_RHI_BACKEND"] = "vulkan"
@@ -149,6 +150,15 @@ class EQGraph(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
         
+        # Determine colors based on the current theme
+        is_dark = isDarkTheme()
+        base_color = QColor(255, 255, 255) if is_dark else QColor(0, 0, 0)
+        
+        # Update the grid and labels to use the dynamic base_color
+        painter.setPen(QPen(base_color, 1))
+        opacity_low = 15 if is_dark else 30
+        opacity_high = 80 if is_dark else 120
+        
         # Use cached coefficients
         def get_eq_db(freq):
             return self.preamp + sum(biquad_response(c, freq) for c in getattr(self, 'cached_coeffs', []))
@@ -186,10 +196,11 @@ class EQGraph(QWidget):
         gain_steps = list(range(int(self.max_db_scale), int(-self.max_db_scale)-1, -6))
         for db in gain_steps:
             y = int(self._db_to_y(db))
-            painter.setPen(QPen(QColor(255, 255, 255, 15 if db != 0 else 80), 1))
+            painter.setPen(QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), opacity_low if db != 0 else opacity_high), 1))
             painter.drawLine(0, y, w, y)
             if db != 0:
-                painter.setPen(QPen(QColor(255, 255, 255, 100)))
+                # Use base_color (which you defined as Black for light mode)
+                painter.setPen(QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), 100)))
                 painter.drawText(5, y - 4 if db < 0 else y + 12, f"{db} dB")
                 
         freq_lines = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
@@ -199,7 +210,7 @@ class EQGraph(QWidget):
             painter.setPen(QPen(QColor(255, 255, 255, 15), 1))
             painter.drawLine(x, 0, x, h)
             if f in freq_labels:
-                painter.setPen(QPen(QColor(255, 255, 255, 100)))
+                painter.setPen(QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), 100)))
                 tw = metrics.horizontalAdvance(freq_labels[f])
                 # Increase the offset for the 20Hz label to prevent clashing with the dB scale
                 x_pos = x - tw//2
@@ -210,7 +221,7 @@ class EQGraph(QWidget):
         # Target Curve
         if self.target_curve and self.visibility.get("target", True):
             path = QPainterPath()
-            painter.setPen(QPen(QColor(255, 255, 255, 80), 2, Qt.DashLine))
+            painter.setPen(QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), 80), 2, Qt.DashLine))
             first = True
             for f, db in self.target_curve:
                 if f < 20 or f > 20000: continue
@@ -277,7 +288,8 @@ class EQGraph(QWidget):
             painter.setPen(QPen(draw_color, 2, Qt.DashLine if is_dashed else Qt.SolidLine))
             painter.drawLine(legend_x, legend_y - 4, legend_x + 20, legend_y - 4)
             
-            text_color = QColor(255, 255, 255, 200) if is_visible else QColor(100, 100, 100, 150)
+            # Uses base_color so the legend text flips to black in light mode
+            text_color = QColor(base_color.red(), base_color.green(), base_color.blue(), 200) if is_visible else QColor(100, 100, 100, 150)
             painter.setPen(QPen(text_color))
             painter.drawText(legend_x + 28, legend_y, text)
             
@@ -287,7 +299,9 @@ class EQGraph(QWidget):
         if self.filters or self.preamp != 0: draw_legend("eq", "EQ Curve", QColor("#0078D4"))
         if self.measurement_curve: draw_legend("eq_meas", "EQ'd Measurement", QColor(0, 208, 132, 200))
         if self.measurement_curve: draw_legend("raw", "Raw Measurement", QColor(255, 136, 0, 100))
-        if self.target_curve: draw_legend("target", "Target Curve", QColor(255, 255, 255, 80), is_dashed=True)
+        
+        # Uses base_color so the target curve dashed line icon isn't invisible
+        if self.target_curve: draw_legend("target", "Target Curve", QColor(base_color.red(), base_color.green(), base_color.blue(), 80), is_dashed=True)
         if self.visibility.get("eq", True): draw_legend("ceiling", "Digital Ceiling", QColor(255, 165, 0, 200), is_dashed=True)
 
     # --- Mouse Events ---
@@ -348,40 +362,27 @@ class Communicator(QObject):
 # --- Main App ---
 class FluentDACController(FluentWindow):
     def __init__(self):
-        setTheme(Theme.DARK)
         super().__init__()
-
+        
         self.setWindowTitle("TRN Control Panel")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
-        self.resize(1000, 750) # Smaller default for laptop screens
+        self.resize(1000, 750) 
         self.setMinimumSize(800, 600)
 
+        # 1. Initialize data and variables first
         self.read_results, self.parsed_filters = {}, {}
         self.hw_info = {"Man": "Loading...", "Prod": "Loading...", "SN": "Loading...", "FW": "Loading..."}
         self.is_syncing, self.active_device = False, None
-        
         self.active_band_idx = 0
         self._updating_ui = False
         self.list_widgets = []
-
         self.comm = Communicator()
-        self.usb_lock = Lock() # <--- Add this line
+        self.usb_lock = Lock() 
         self.settings_data = self.load_settings()
         self.actual_sn, self.sn_hidden, self.last_raw_vol = "", True, 0
-        self.last_user_vol_change = 0  # Tracks when you grab the slider
         
-        # Optimization: USB Debounce Queue
+        # Restore the dropped variables
         self.dirty_usb_tasks = set()
-        self.usb_timer = QTimer(self)
-        self.usb_timer.setInterval(40)
-        self.usb_timer.timeout.connect(self._process_usb_queue)
-
-        # Auto-Flash Timer: Waits 3 seconds after inactivity to commit to hardware flash
-        self.auto_flash_timer = QTimer(self)
-        self.auto_flash_timer.setSingleShot(True)
-        self.auto_flash_timer.setInterval(3000) 
-        self.auto_flash_timer.timeout.connect(self._commit_to_flash)
-        
         self.filter_desc_map = {
             "FAST-LL": "Fast roll-off, Low Latency. Best for gaming.",
             "Fast-PC (BEST)": "Fast roll-off, Phase Compensated. Recommended for general listening.",
@@ -390,16 +391,45 @@ class FluentDACController(FluentWindow):
             "NOS": "Non-Oversampling. Purest signal path, high frequency roll-off."
         }
         
+        # 2. Define the frames BEFORE calling _setup_ui
         self.dac_interface = QFrame(self)
         self.eq_interface = QFrame(self)
         self.about_interface = QFrame(self)
-        
         self.dac_interface.setObjectName("dac_interface")
         self.eq_interface.setObjectName("eq_interface")
         self.about_interface.setObjectName("about_interface")
-        
+
+        # 3. Create the UI
         self._setup_ui()
         self._connect_logic()
+
+        # 4. Native PySide6 OS Hook (Bypasses qfluentwidgets listener bugs)
+        app = QApplication.instance()
+        if hasattr(app.styleHints(), 'colorSchemeChanged'):
+            app.styleHints().colorSchemeChanged.connect(self._force_theme_sync)
+        else:
+            qconfig.themeChanged.connect(self._on_theme_changed)
+
+        # 5. Apply the Windows Accent Color after the UI is built
+        if sys.platform == "win32":
+            self._last_accent_color = getSystemAccentColor()
+            setThemeColor(self._last_accent_color, save=False)
+        else:
+            self._last_accent_color = None
+
+        # 6. Initialize Timers
+        self.usb_timer = QTimer(self)
+        self.usb_timer.setInterval(40)
+        self.usb_timer.timeout.connect(self._process_usb_queue)
+
+        self.auto_flash_timer = QTimer(self)
+        self.auto_flash_timer.setSingleShot(True)
+        self.auto_flash_timer.setInterval(3000) 
+        self.auto_flash_timer.timeout.connect(self._commit_to_flash)
+
+        self.conn_timer = QTimer(self)
+        self.conn_timer.timeout.connect(self._check_connection)
+        self.conn_timer.start(2000)
         
         self.conn_timer = QTimer(self)
         self.conn_timer.timeout.connect(self._check_connection)
@@ -411,6 +441,33 @@ class FluentDACController(FluentWindow):
         self.vol_poll_timer.start(300)
 
         QTimer.singleShot(500, self.refresh)
+        
+        
+    # Add 'theme' parameter to catch the signal data
+    def _on_theme_changed(self, theme=None):
+        """Forces a full redraw of custom components and graphs when Windows theme changes."""
+        # 1. Update the custom graphs
+        self.graph.update()
+        self.small_graph.update()
+        
+        # 2. Refresh the window stylesheet to ensure text/icons update
+        # Use QApplication.instance() to safely grab the global app style
+        self.setStyle(QApplication.instance().style())
+        
+        # 3. Optional: If you have specific icons that don't change, re-set them here
+        # For example, if your window icon has a light/dark version:
+        # self.setWindowIcon(QIcon(resource_path("icon.ico")))
+
+    def _force_theme_sync(self, scheme):
+        """Takes over Auto-Theming directly from the PySide6 engine."""
+        is_dark = (scheme == Qt.ColorScheme.Dark)
+        setTheme(Theme.DARK if is_dark else Theme.LIGHT)
+        
+        # Re-fetch and apply the new Windows accent color to the widgets
+        if sys.platform == "win32":
+            setThemeColor(getSystemAccentColor())
+            
+        self._on_theme_changed()
 
     def load_settings(self):
         default_filters = [{"type": "PK", "freq": DEFAULT_FREQS[i], "q": 1.0, "gain": 0.0, "enabled": True, "lock_freq": False, "lock_gain": False, "lock_q": False} for i in range(10)]
@@ -687,7 +744,7 @@ class FluentDACController(FluentWindow):
         graph_layout.addWidget(self.graph, 1)
 
         self.active_band_card = SimpleCardWidget(self.graph_page)
-        self.active_band_card.setStyleSheet("SimpleCardWidget { background: transparent; border: 1px solid rgba(255, 255, 255, 0.08); }")
+        self.active_band_card.setStyleSheet("SimpleCardWidget { background: transparent; }")
         bl = QHBoxLayout(self.active_band_card)
         bl.setContentsMargins(10, 5, 10, 5)
 
@@ -742,7 +799,8 @@ class FluentDACController(FluentWindow):
             band_card = SimpleCardWidget(list_container)
             # Set fixed height and bottom-only border for clean stacking
             band_card.setFixedHeight(50)
-            band_card.setStyleSheet("SimpleCardWidget { background: transparent; border: none; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }")
+            # Remove the rgba(255, 255, 255...) to let the theme handle the line color
+            band_card.setStyleSheet("SimpleCardWidget { background: transparent; border: none; border-bottom: 1px solid rgba(128, 128, 128, 0.2); }")
             
             lbl_layout = QHBoxLayout(band_card)
             lbl_layout.setContentsMargins(10, 0, 10, 0)
@@ -1114,6 +1172,16 @@ class FluentDACController(FluentWindow):
 
     # --- Hardware & Application Logic ---
     def _check_connection(self):
+        # 1. Live Windows Accent Color Tracking
+        if sys.platform == "win32":
+            current_color = getSystemAccentColor()
+            if current_color != self._last_accent_color:
+                self._last_accent_color = current_color
+                setThemeColor(current_color, save=False)
+                # Force widgets to recompile their stylesheets with the new color
+                self._on_theme_changed()
+
+        # 2. USB Connection Logic
         dev = self.get_device()
         if not dev and self.lbl_sn.text() != "Serial: Disconnected":
             self.comm.status_msg.emit("Disconnected")
@@ -1536,6 +1604,9 @@ if __name__ == "__main__":
         pass
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path("icon.ico")))
+    
+    setTheme(Theme.AUTO) 
+    
     window = FluentDACController()
     window.show()
     sys.exit(app.exec())
