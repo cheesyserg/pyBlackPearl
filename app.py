@@ -442,6 +442,40 @@ class FluentDACController(FluentWindow):
 
         QTimer.singleShot(500, self.refresh)
         
+    def _identify_preset(self, parsed_filters):
+        """Compares live hardware EQ state to saved PC presets."""
+        for idx, preset in enumerate(self.settings_data["presets"]):
+            if preset["name"] == "None": 
+                continue # Skip the fallback template
+                
+            match = True
+            for i in range(10):
+                pf = parsed_filters.get(i, {})
+                sf = preset["filters"][i]
+                
+                # Hardware vs Saved Gain (Treat disabled saved filters as 0.0 gain)
+                pg = float(pf.get("gain", 0.0))
+                sg = float(sf.get("gain", 0.0)) if sf.get("enabled", True) else 0.0
+                
+                if abs(pg - sg) > 0.1:
+                    match = False
+                    break
+                    
+                # Only strictly check freq/q/type if the band is actively changing sound (gain != 0)
+                if abs(pg) > 0.1 or abs(sg) > 0.1:
+                    if abs(float(pf.get("freq", 1000)) - float(sf.get("freq", 1000))) > 1.0:
+                        match = False
+                        break
+                    if abs(float(pf.get("q", 1.0)) - float(sf.get("q", 1.0))) > 0.05:
+                        match = False
+                        break
+                    if pf.get("type", "PK") != sf.get("type", "PK"):
+                        match = False
+                        break
+            if match:
+                return idx
+        return -1
+        
         
     # Add 'theme' parameter to catch the signal data
     def _on_theme_changed(self, theme=None):
@@ -471,12 +505,21 @@ class FluentDACController(FluentWindow):
 
     def load_settings(self):
         default_filters = [{"type": "PK", "freq": DEFAULT_FREQS[i], "q": 1.0, "gain": 0.0, "enabled": True, "lock_freq": False, "lock_gain": False, "lock_q": False} for i in range(10)]
-        default_data = {"balance": 0, "last_preset": 0, "presets": [{"name": "Default", "preamp": 0.0, "filters": default_filters}]}
+        default_data = {"balance": 0, "last_preset": 0, "presets": [{"name": "None", "preamp": 0.0, "filters": default_filters}]}
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r") as f: 
                     data = {**default_data, **json.load(f)}
-                    # FAIL-SAFE: Ensure the saved preset index actually exists
+                    
+                    # Convert legacy "Default" to "None"
+                    for p in data.get("presets", []):
+                        if p["name"] == "Default":
+                            p["name"] = "None"
+                            
+                    # Ensure "None" exists
+                    if not any(p["name"] == "None" for p in data.get("presets", [])):
+                        data["presets"].insert(0, {"name": "None", "preamp": 0.0, "filters": default_filters})
+                        
                     if data.get("last_preset", 0) >= len(data.get("presets", [])):
                         data["last_preset"] = 0
                     return data
@@ -1328,54 +1371,66 @@ class FluentDACController(FluentWindow):
 
     def update_ui_state(self, info, results, filters):
         self.is_syncing = True
-        self.lbl_man.setText("Manufacturer: TRN"); self.lbl_prod.setText("Product: Black Pearl(TE-C)")
-        self.actual_sn = info['SN']
-        self.lbl_sn.setText(f"Serial: {'********' if self.sn_hidden else self.actual_sn}")
-        self.lbl_fw.setText(f"Firmware: {self.hw_info['FW']}"); self.toggle_controls(True)
+        self._updating_ui = True
         
-        # Consolidation Logic for Balance
-        # Better Consolidation: Choose the strongest offset and ignore hardware noise (+/- 1)
+        # 1. Update Hardware Info
+        self.lbl_man.setText("Manufacturer: TRN")
+        self.lbl_prod.setText("Product: Black Pearl(TE-C)")
+        self.actual_sn = info.get('SN', 'Unknown')
+        self.lbl_sn.setText(f"Serial: {'********' if self.sn_hidden else self.actual_sn}")
+        self.lbl_fw.setText(f"Firmware: {self.hw_info.get('FW', 'Unknown')}")
+        self.toggle_controls(True)
+        
+        # 2. Update Balance
         bal_l = results.get("bal_l", 0)
         bal_r = results.get("bal_r", 0)
         bal = bal_l if abs(bal_l) > abs(bal_r) else bal_r
-        
-        # Snap-to-Zero: If hardware reports a tiny offset of 1 (firmware bug), treat it as 0
         if abs(bal) <= 1: bal = 0
-        
-        self._updating_ui = True
         self.bal_slider.setValue(bal)
         self.bal_txt.setText(f"L {abs(bal)}" if bal < 0 else f"R {bal}" if bal > 0 else "Center")
-        self._updating_ui = False
 
-        self._check_headroom(auto_level=False)
+        # 3. Update Mic Gain
+        if "mic_gain" in results:
+            val = results["mic_gain"]
+            self.mic_slider.setValue(val)
+            self.mic_txt.setText(f"{val:+d} dB")
+
+        # 4. Update DAC Settings
         mapping = {0x11: (self.cb_filter, FILTER_MAP), 0x19: (self.cb_gain, GAIN_MAP), 0x1D: (self.cb_amp, AMP_MAP)}
         for cmd, (w, m) in mapping.items():
             if cmd in results: w.setCurrentText(m.get(results[cmd], "Unknown"))
-        
         self.desc_filter.setText(self.filter_desc_map.get(self.cb_filter.currentText(), ""))
-
-        p = self.settings_data["presets"][self.preset_cb.currentIndex()]
-        if CMD_GLOBAL_GAIN in results:
-            g_val = results[CMD_GLOBAL_GAIN]
-            p = self.settings_data["presets"][self.preset_cb.currentIndex()]
-            p["preamp"] = float(g_val)
-            self._updating_ui = False
-           
-                
-        self._sync_all_uis()
-        self.is_syncing = False; self.refresh_status_lbl_dac.setText("");
-
-        if "mic_gain" in results:
-                    self._updating_ui = True
-                    val = results["mic_gain"]
-                    self.mic_slider.setValue(val)
-                    self.mic_txt.setText(f"{val:+d} dB")
-                    self._updating_ui = False
+            
+        # 5. PEQ Identity Logic (Now runs on every sync/reconnect)
+        matched_idx = self._identify_preset(filters)
         
-        if not hasattr(self, '_boot_sync_complete'):
-            self._boot_sync_complete = True
-            # The hardware is now ready. Force the PC's saved preset onto the DAC.
-            self._load_preset_ui()
+        if matched_idx != -1:
+            self.preset_cb.setCurrentIndex(matched_idx)
+        else:
+            none_idx = next((i for i, p in enumerate(self.settings_data["presets"]) if p["name"] == "None"), 0)
+            none_p = self.settings_data["presets"][none_idx]
+            
+            if CMD_GLOBAL_GAIN in results:
+                none_p["preamp"] = float(results[CMD_GLOBAL_GAIN])
+                
+            for i in range(10):
+                if i in filters:
+                    none_p["filters"][i].update({
+                        "freq": filters[i]["freq"],
+                        "gain": filters[i]["gain"],
+                        "q": filters[i]["q"],
+                        "type": filters[i]["type"],
+                        "enabled": (filters[i]["gain"] != 0.0)
+                    })
+            self.preset_cb.setCurrentIndex(none_idx)
+
+        # 6. Finalize UI 
+        self._updating_ui = False
+        self._load_preset_ui() 
+        self._check_headroom(auto_level=False)
+        
+        self.is_syncing = False
+        self.refresh_status_lbl_dac.setText("")
 
     def _apply_filter(self, idx):
         if self.is_syncing: return
