@@ -19,7 +19,8 @@ from qfluentwidgets import (
     ComboBox, Slider, LineEdit, CheckBox, CardWidget, InfoBar, 
     StrongBodyLabel, setTheme, Theme, FluentIcon, BodyLabel, 
     TransparentToolButton, SmoothScrollArea, SimpleCardWidget,
-    NavigationItemPosition, isDarkTheme, qconfig, setThemeColor
+    NavigationItemPosition, isDarkTheme, qconfig, setThemeColor,
+    MessageBoxBase, MessageBox # Added MessageBoxBase
 )
 from qframelesswindow.utils import getSystemAccentColor
 
@@ -358,6 +359,27 @@ class Communicator(QObject):
     sync_finished = Signal(object, object, object)
     status_msg = Signal(str)
     hw_vol_changed = Signal(int)  # Emitted when physical DAC buttons are pressed
+    
+class CustomInputDialog(MessageBoxBase):
+    """ Modern WinUI-styled input dialog """
+    def __init__(self, title, content, parent=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(title, self)
+        self.contentLabel = BodyLabel(content, self)
+        self.lineEdit = LineEdit(self)
+        
+        self.lineEdit.setPlaceholderText("Enter preset name...")
+        self.lineEdit.setClearButtonEnabled(True)
+
+        # Add widgets to the internal WinUI layout
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.contentLabel)
+        self.viewLayout.addWidget(self.lineEdit)
+
+        # Set dialog width to match WinUI standards
+        self.widget.setMinimumWidth(350)
+        self.yesButton.setText("Create")
+        self.cancelButton.setText("Cancel")
 
 # --- Main App ---
 class FluentDACController(FluentWindow):
@@ -441,6 +463,29 @@ class FluentDACController(FluentWindow):
         self.vol_poll_timer.start(300)
 
         QTimer.singleShot(500, self.refresh)
+        
+    def _delete_preset(self):
+        idx = self.preset_cb.currentIndex()
+        name = self.preset_cb.currentText()
+        
+        if name == "None":
+            InfoBar.warning("Forbidden", "The 'None' preset cannot be deleted.", parent=self)
+            return
+            
+        # Confirmation Dialog
+        title = "Confirm Deletion"
+        content = f"Are you sure you want to permanently delete the '{name}' preset?"
+        from qfluentwidgets import MessageBox
+        w = MessageBox(title, content, self)
+        w.yesButton.setText("Delete")      
+        w.cancelButton.setText("Keep It") 
+        if w.exec():
+            self.settings_data["presets"].pop(idx)
+            self.preset_cb.removeItem(idx)
+            # Default to index 0 (None)
+            self.preset_cb.setCurrentIndex(0)
+            self.save_settings()
+            InfoBar.success("Deleted", f"Preset '{name}' removed.", parent=self)
         
     def _identify_preset(self, parsed_filters):
         """Compares live hardware EQ state to saved PC presets."""
@@ -701,6 +746,11 @@ class FluentDACController(FluentWindow):
         self.btn_add.setToolTip("Create New Preset")
         self.btn_add.clicked.connect(self._new_preset)
         top_bar.addWidget(self.btn_add)
+        
+        self.btn_delete = TransparentToolButton(FluentIcon.DELETE, header_frame)
+        self.btn_delete.setToolTip("Delete Current Preset")
+        self.btn_delete.clicked.connect(self._delete_preset)
+        top_bar.addWidget(self.btn_delete)
 
         self.btn_reset = PushButton("Flat EQ", header_frame)
         self.btn_reset.clicked.connect(self._reset_eq)
@@ -1120,6 +1170,7 @@ class FluentDACController(FluentWindow):
         
         self._sync_all_uis(update_idx=idx)
         self._apply_filter(idx)
+        self.save_settings()
 
     def _on_list_ui_changed(self, idx):
         if self._updating_ui: return
@@ -1137,6 +1188,7 @@ class FluentDACController(FluentWindow):
         
         self._sync_all_uis(update_idx=idx)
         self._apply_filter(idx)
+        self.save_settings()
         
     def _on_gain_val_edited(self):
         if self._updating_ui: return
@@ -1292,10 +1344,7 @@ class FluentDACController(FluentWindow):
     def refresh(self):
         if self.is_syncing: return
         self.is_syncing = True
-        
-        # Only update the DAC label since the EQ label was removed
         self.refresh_status_lbl_dac.setText("Refreshing...")
-        
         self.read_results.clear()
         self.parsed_filters.clear()
 
@@ -1303,30 +1352,46 @@ class FluentDACController(FluentWindow):
             with self.usb_lock:
                 dev = self.get_device()
                 if not dev: 
-                    self.comm.status_msg.emit("Disconnected")
                     self.is_syncing = False
                     return
+
                 try:
                     report = dev.find_output_reports()[0]
-                    for cmd in [CMD_VERSION, 0x11, 0x19, 0x1D, CMD_GLOBAL_GAIN, 0x02, "BAL_L", "BAL_R"]:
-                        if cmd == 0x02:
-                            report.send([REPORT_ID, READ, 0x02, 0x02] + [0x00]*60)
-                        elif cmd == "BAL_L":
-                            report.send([REPORT_ID, READ, 0x16, 0x04, 0x01, 0x00, 0x00] + [0x00]*57)
-                        elif cmd == "BAL_R":
-                            report.send([REPORT_ID, READ, 0x16, 0x04, 0x00, 0x00, 0x00] + [0x00]*57)
-                        else:
-                            report.send([REPORT_ID, READ, cmd, END] + [0x00]*60)
-                        time.sleep(0.06)
                     
+                    def send_and_wait(pkt, key, timeout=0.15, is_peq=False):
+                        report.send(pkt)
+                        start = time.time()
+                        while time.time() - start < timeout:
+                            if is_peq and key in self.parsed_filters: return True
+                            if not is_peq and key in self.read_results: return True
+                            time.sleep(0.01)
+                        return False
+
+                    tasks = [
+                        ([REPORT_ID, READ, CMD_VERSION, END] + [0x00]*60, CMD_VERSION),
+                        ([REPORT_ID, READ, 0x11, END] + [0x00]*60, 0x11),
+                        ([REPORT_ID, READ, 0x19, END] + [0x00]*60, 0x19),
+                        ([REPORT_ID, READ, 0x1D, END] + [0x00]*60, 0x1D),
+                        ([REPORT_ID, READ, CMD_GLOBAL_GAIN, END] + [0x00]*60, CMD_GLOBAL_GAIN),
+                        ([REPORT_ID, READ, 0x02, 0x02] + [0x00]*60, "mic_gain"),
+                        ([REPORT_ID, READ, 0x16, 0x04, 0x01, 0x00, 0x00] + [0x00]*57, "bal_l"),
+                        ([REPORT_ID, READ, 0x16, 0x04, 0x00, 0x00, 0x00] + [0x00]*57, "bal_r"),
+                    ]
+
+                    for pkt, key in tasks:
+                        for _ in range(2): 
+                            if send_and_wait(pkt, key): break
+
                     for i in range(10):
-                        report.send([REPORT_ID, READ, CMD_PEQ_VALUES, 0x00, 0x00, i, END] + [0x00]*57)
-                        time.sleep(0.06)
-                    
-                    time.sleep(0.3)
+                        pkt = [REPORT_ID, READ, CMD_PEQ_VALUES, 0x00, 0x00, i, END] + [0x00]*57
+                        for _ in range(2):
+                            if send_and_wait(pkt, i, is_peq=True): break
+
                     self.comm.sync_finished.emit({"SN": dev.serial_number}, self.read_results, self.parsed_filters)
-                except: 
+                except Exception as e: print(f"Sync error: {e}")
+                finally:
                     self.is_syncing = False
+                    self.refresh_status_lbl_dac.setText("")
         Thread(target=run, daemon=True).start()
         
     def on_data(self, data):
@@ -1334,9 +1399,17 @@ class FluentDACController(FluentWindow):
             cmd = data[2]
             if cmd == CMD_VERSION: self.hw_info["FW"] = bytes(data[4:]).split(b'\x00')[0].decode('ascii', errors='ignore').strip() or "Unknown"
             elif cmd == CMD_PEQ_VALUES and len(data) >= 37:
-                idx, f, q, g = data[5], data[28]|(data[29]<<8), round((data[30]|(data[31]<<8))/256.0, 2), data[32]|(data[33]<<8)
-                if g > 32767: g -= 65536
-                self.parsed_filters[idx] = {"freq": f, "q": q, "gain": round(g/256.0, 1), "type": INV_TYPE_CODES.get(data[34], "PK")}
+                idx = data[5]
+                f = data[28]|(data[29]<<8)
+                q = round((data[30]|(data[31]<<8))/256.0, 2)
+                g_raw = data[32]|(data[33]<<8)
+                if g_raw > 32767: g_raw -= 65536
+                g = round(g_raw/256.0, 1)
+                
+                # SNAP LOGIC: Kill ghost gains below 0.25dB
+                if abs(g) < 0.25: g = 0.0
+                
+                self.parsed_filters[idx] = {"freq": f, "q": q, "gain": g, "type": INV_TYPE_CODES.get(data[34], "PK")}
                 self.active_slot = data[36]
             elif cmd == CMD_GLOBAL_GAIN: 
                 raw_vol = struct.unpack("<h", bytes(data[4:6]))[0]
@@ -1562,12 +1635,35 @@ class FluentDACController(FluentWindow):
 
 
     def _new_preset(self):
-        name, ok = QInputDialog.getText(self, "New Preset", "Name:")
-        if ok and name:
-            df = [{"type": "PK", "freq": DEFAULT_FREQS[i], "q": 1.0, "gain": 0.0, "enabled": True, "lock_freq": False, "lock_gain": False, "lock_q": False} for i in range(10)]
-            self.settings_data["presets"].append({"name": name, "preamp": 0.0, "filters": df})
-            self.preset_cb.addItem(name)
-            self.preset_cb.setCurrentIndex(self.preset_cb.count() - 1)
+        # Call the custom WinUI dialog we just created
+        dialog = CustomInputDialog("Create New Preset", "Enter a unique name for your profile:", self)
+
+        if dialog.exec():
+            name = dialog.lineEdit.text().strip()
+            if name:
+                # Prevent duplicate names
+                if any(p["name"] == name for p in self.settings_data["presets"]):
+                    InfoBar.warning("Duplicate Name", f"Preset '{name}' already exists.", parent=self)
+                    return
+
+                df = [{"type": "PK", "freq": DEFAULT_FREQS[i], "q": 1.0, "gain": 0.0, "enabled": True, "lock_freq": False, "lock_gain": False, "lock_q": False} for i in range(10)]
+                self.settings_data["presets"].append({"name": name, "preamp": 0.0, "filters": df})
+                self.preset_cb.addItem(name)
+                self.preset_cb.setCurrentIndex(self.preset_cb.count() - 1)
+                self.save_settings()
+                InfoBar.success("Success", f"Preset '{name}' created.", parent=self)
+            if name:
+                # Check for duplicate names
+                if any(p["name"] == name for p in self.settings_data["presets"]):
+                    InfoBar.warning("Duplicate Name", f"A preset named '{name}' already exists.", parent=self)
+                    return
+
+                df = [{"type": "PK", "freq": DEFAULT_FREQS[i], "q": 1.0, "gain": 0.0, "enabled": True, "lock_freq": False, "lock_gain": False, "lock_q": False} for i in range(10)]
+                self.settings_data["presets"].append({"name": name, "preamp": 0.0, "filters": df})
+                self.preset_cb.addItem(name)
+                self.preset_cb.setCurrentIndex(self.preset_cb.count() - 1)
+                self.save_settings()
+                InfoBar.success("Preset Created", f"'{name}' is ready to be configured.", parent=self)
 
     def _import_squig(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open AutoEQ File", "", "Text Files (*.txt);;All Files (*)")
@@ -1598,6 +1694,8 @@ class FluentDACController(FluentWindow):
                     idx += 1
             for i in range(10): self._apply_filter(i)
             self._sync_all_uis()
+            self.save_settings()
+            InfoBar.success("Import", "AutoEQ settings applied and saved.", parent=self)
         except: pass
         
     def _export_autoeq(self):
