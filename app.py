@@ -1286,15 +1286,14 @@ class FluentDACController(FluentWindow):
     def toggle_controls(self, enabled):
         objs = [self.vol_slider, self.eq_vol_slider, self.bal_slider, self.cb_filter, 
                 self.cb_gain, self.cb_amp, self.preset_cb, 
-                self.btn_reset, self.btn_add, self.btn_import_meas, self.btn_import_target,
+                self.btn_reset, self.btn_add, self.btn_delete, # <-- Added self.btn_delete here
+                self.btn_import_meas, self.btn_import_target,
                 self.btn_import, self.btn_export, self.graph, self.small_graph,
                 self.btn_toggle_view, self.active_band_card,
                 self.band_enable, self.band_type, self.band_freq, self.band_gain_sld, 
                 self.band_gain_val, self.band_q_val, self.lock_freq, self.lock_gain, self.lock_q,
                 self.btn_factory_reset, self.mic_slider]
         for o in objs: o.setEnabled(enabled)
-        for lw in self.list_widgets:
-            for k, w in lw.items(): w.setEnabled(enabled)
 
     def _create_row(self, layout, title, mapping, cmd, default_desc=""):
         card = SimpleCardWidget(self)
