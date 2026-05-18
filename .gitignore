@@ -12,3 +12,6 @@ build/
 dist/
 *.manifest
 *.spec
+
+# add settings.json
+#settings.json
