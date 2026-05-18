@@ -9,18 +9,17 @@ import ctypes
 from threading import Thread, Lock
 from PySide6.QtGui import QIcon, QPainter, QColor, QPen, QBrush, QPainterPath, QPixmap
 
-
-import pywinusb.hid as hid
+import hid
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize
 from PySide6.QtWidgets import QApplication, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QFileDialog, QInputDialog, QStackedWidget
 
 from qfluentwidgets import (
-    FluentWindow, SubtitleLabel, CaptionLabel, PushButton, PrimaryPushButton, 
-    ComboBox, Slider, LineEdit, CheckBox, CardWidget, InfoBar, 
-    StrongBodyLabel, setTheme, Theme, FluentIcon, BodyLabel, 
+    FluentWindow, SubtitleLabel, CaptionLabel, PushButton, PrimaryPushButton,
+    ComboBox, Slider, LineEdit, CheckBox, CardWidget, InfoBar,
+    StrongBodyLabel, setTheme, Theme, FluentIcon, BodyLabel,
     TransparentToolButton, SmoothScrollArea, SimpleCardWidget,
     NavigationItemPosition, isDarkTheme, qconfig, setThemeColor,
-    MessageBoxBase, MessageBox # Added MessageBoxBase
+    MessageBoxBase, MessageBox
 )
 from qframelesswindow.utils import getSystemAccentColor
 
@@ -45,7 +44,6 @@ CMD_MIC_GAIN_ADDR = 0x02
 TYPE_CODES = {"PK": 0x02, "LS": 0x03, "HS": 0x04}
 INV_TYPE_CODES = {v: k for k, v in TYPE_CODES.items()}
 
-
 FILTER_MAP = {0x01: "FAST-LL", 0x02: "Fast-PC (BEST)", 0x03: "Slow-LL", 0x04: "SLOW-PC", 0x05: "NOS"}
 GAIN_MAP = {0x00: "LOW", 0x01: "HIGH"}
 AMP_MAP = {0x00: "CLASS H", 0x01: "CLASS AB"}
@@ -61,7 +59,7 @@ def _calc_coeffs(t, f, q, g, fs=48000):
     sn = math.sin(w0)
     cs = math.cos(w0)
     alpha = sn/(2*q)
-    
+
     if t == "PK":
         b0, b1, b2 = 1+alpha*A, -2*cs, 1-alpha*A
         a0, a1, a2 = 1+alpha/A, -2*cs, 1-alpha/A
@@ -74,7 +72,7 @@ def _calc_coeffs(t, f, q, g, fs=48000):
         a1 = s*2*((A-1)-s*(A+1)*cs)
         a2 = (A+1)-s*(A-1)*cs-2*sqA*alpha
     else: return (1.0, 0.0, 0.0, 0.0, 0.0)
-    
+
     return (b0/a0, b1/a0, b2/a0, a1/a0, a2/a0)
 
 def biquad_response(coeffs, freq_hz, fs=48000):
@@ -82,12 +80,12 @@ def biquad_response(coeffs, freq_hz, fs=48000):
     w = 2 * math.pi * freq_hz / fs
     cos_w, sin_w = math.cos(w), math.sin(w)
     cos_2w, sin_2w = math.cos(2*w), math.sin(2*w)
-    
+
     num_re = b0 + b1*cos_w + b2*cos_2w
     num_im = -b1*sin_w - b2*sin_2w
     den_re = 1 + a1*cos_w + a2*cos_2w
     den_im = -a1*sin_w - a2*sin_2w
-    
+
     mag2 = (num_re**2 + num_im**2) / (den_re**2 + den_im**2) if (den_re**2 + den_im**2) != 0 else 1.0
     return 10 * math.log10(mag2) if mag2 > 0 else 0.0
 
@@ -107,16 +105,15 @@ class EQGraph(QWidget):
         self.dragging_idx = -1
         self.preamp = 0.0
         self.max_db_scale = 18.0
-        
+
         self.visibility = {"eq": True, "eq_meas": True, "raw": True, "target": True, "ceiling": True}
         self.legend_rects = {}
-        self.is_clipping = False  
-        self.headroom_db = 100.0  
-        
+        self.is_clipping = False
+        self.headroom_db = 100.0
+
         self.setAttribute(Qt.WA_TranslucentBackground)
 
     def _downsample(self, data, max_points=300):
-        """Compresses large arrays once during import so the paintEvent stays fast"""
         if not data: return None
         step = max(1, len(data) // max_points)
         return data[::step]
@@ -133,14 +130,12 @@ class EQGraph(QWidget):
         self.filters = filters
         self.active_idx = active_idx
         self.preamp = preamp
-        # Correctly cache coefficients so the screen doesn't lag
         self.cached_coeffs = [
-            _calc_coeffs(f["type"], f["freq"], f["q"], f["gain"]) 
+            _calc_coeffs(f["type"], f["freq"], f["q"], f["gain"])
             for f in self.filters if f.get("enabled", True)
         ]
         self.update()
 
-    # --- Math Helpers ---
     def _x_to_f(self, x): return 20.0 * (1000.0 ** (x / max(1, self.width())))
     def _f_to_x(self, f): return self.width() * math.log10(max(1, f) / 20.0) / 3.0
     def _db_to_y(self, db): return (self.height() / 2.0) - (db / self.max_db_scale) * (self.height() / 2.0)
@@ -150,34 +145,28 @@ class EQGraph(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        
-        # Determine colors based on the current theme
+
         is_dark = isDarkTheme()
         base_color = QColor(255, 255, 255) if is_dark else QColor(0, 0, 0)
-        
-        # Update the grid and labels to use the dynamic base_color
+
         painter.setPen(QPen(base_color, 1))
         opacity_low = 15 if is_dark else 30
         opacity_high = 80 if is_dark else 120
-        
-        # Use cached coefficients
+
         def get_eq_db(freq):
             return self.preamp + sum(biquad_response(c, freq) for c in getattr(self, 'cached_coeffs', []))
 
         max_val = 18.0
 
-        # 1. Main EQ Line Math (Step increased to 5 for smoother performance)
         curve_points = []
-        step = 5 
+        step = 5
         for x in range(0, w + step, step):
             freq = self._x_to_f(x)
             db_total = get_eq_db(freq)
-            # Pre-calculate Y coordinate once to save cycles later
-            curve_points.append((x, self._db_to_y(db_total))) 
-            if self.visibility.get("eq", True): 
+            curve_points.append((x, self._db_to_y(db_total)))
+            if self.visibility.get("eq", True):
                 max_val = max(max_val, abs(db_total))
 
-        # 2. Measurement Math (Now extremely fast due to downsampling)
         eq_meas_points = []
         if self.measurement_curve:
             for f, db in self.measurement_curve:
@@ -192,7 +181,6 @@ class EQGraph(QWidget):
 
         self.max_db_scale = max(18.0, math.ceil(max_val / 6.0) * 6.0)
 
-        # Draw Grid
         metrics = painter.fontMetrics()
         gain_steps = list(range(int(self.max_db_scale), int(-self.max_db_scale)-1, -6))
         for db in gain_steps:
@@ -200,10 +188,9 @@ class EQGraph(QWidget):
             painter.setPen(QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), opacity_low if db != 0 else opacity_high), 1))
             painter.drawLine(0, y, w, y)
             if db != 0:
-                # Use base_color (which you defined as Black for light mode)
                 painter.setPen(QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), 100)))
                 painter.drawText(5, y - 4 if db < 0 else y + 12, f"{db} dB")
-                
+
         freq_lines = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
         freq_labels = {20: "20", 50: "50", 100: "100", 200: "200", 500: "500", 1000: "1k", 2000: "2k", 5000: "5k", 10000: "10k", 20000: "20k"}
         for f in freq_lines:
@@ -213,13 +200,11 @@ class EQGraph(QWidget):
             if f in freq_labels:
                 painter.setPen(QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), 100)))
                 tw = metrics.horizontalAdvance(freq_labels[f])
-                # Increase the offset for the 20Hz label to prevent clashing with the dB scale
                 x_pos = x - tw//2
-                if f == 20: 
-                    x_pos = max(45, x_pos) # Increased from 30 to 45 for better clearance
+                if f == 20:
+                    x_pos = max(45, x_pos)
                 painter.drawText(min(w - tw - 5, x_pos), h - 5, freq_labels[f])
 
-        # Target Curve
         if self.target_curve and self.visibility.get("target", True):
             path = QPainterPath()
             painter.setPen(QPen(QColor(base_color.red(), base_color.green(), base_color.blue(), 80), 2, Qt.DashLine))
@@ -230,8 +215,7 @@ class EQGraph(QWidget):
                 if first: path.moveTo(x, y); first = False
                 else: path.lineTo(x, y)
             if not first: painter.drawPath(path)
-            
-        # Raw Measurement
+
         if self.measurement_curve and self.visibility.get("raw", True):
             path = QPainterPath()
             painter.setPen(QPen(QColor(255, 136, 0, 100), 2))
@@ -243,7 +227,6 @@ class EQGraph(QWidget):
                 else: path.lineTo(x, y)
             if not first: painter.drawPath(path)
 
-        # EQ'd Compensated Measurement
         if eq_meas_points and self.visibility.get("eq_meas", True):
             path = QPainterPath()
             painter.setPen(QPen(QColor(0, 208, 132, 200), 2))
@@ -253,16 +236,13 @@ class EQGraph(QWidget):
                 if first: path.moveTo(x, y); first = False
                 else: path.lineTo(x, y)
             if not first: painter.drawPath(path)
-        
-        # Main EQ Curve & Control Points
+
         if self.visibility.get("eq", True):
             path = QPainterPath()
-            # curve_points already contains the screen Y, so we use it directly
             for i, (x, y) in enumerate(curve_points):
                 if i == 0: path.moveTo(x, y)
                 else: path.lineTo(x, y)
-            
-            # Draw the path to the screen
+
             hy = int(self._db_to_y(self.headroom_db))
             painter.setPen(QPen(QColor(255, 165, 0, 200), 2, Qt.DashLine))
             painter.drawLine(0, hy, w, hy)
@@ -270,44 +250,39 @@ class EQGraph(QWidget):
             color = QColor("#ff4d4d") if self.is_clipping else QColor("#0078D4")
             painter.setPen(QPen(color, 2))
             painter.drawPath(path)
-            
+
             for i, f in enumerate(self.filters):
                 cx, cy = self._f_to_x(f["freq"]), self._db_to_y(f["gain"] + self.preamp)
                 painter.setPen(QPen(QColor("#FFFFFF" if i == self.active_idx else "#888888"), 2 if i == self.active_idx else 1))
                 painter.setBrush(QBrush(color if i == self.active_idx else QColor("#444444")))
                 painter.drawEllipse(int(cx)-5, int(cy)-5, 10, 10)
 
-        # Draw Interactive Legend
-        legend_y, legend_x = h - 25, 55 
+        legend_y, legend_x = h - 25, 55
         self.legend_rects.clear()
 
         def draw_legend(key, text, color, is_dashed=False):
             nonlocal legend_y
             is_visible = self.visibility.get(key, True)
-            
+
             draw_color = color if is_visible else QColor(100, 100, 100, 100)
             painter.setPen(QPen(draw_color, 2, Qt.DashLine if is_dashed else Qt.SolidLine))
             painter.drawLine(legend_x, legend_y - 4, legend_x + 20, legend_y - 4)
-            
-            # Uses base_color so the legend text flips to black in light mode
+
             text_color = QColor(base_color.red(), base_color.green(), base_color.blue(), 200) if is_visible else QColor(100, 100, 100, 150)
             painter.setPen(QPen(text_color))
             painter.drawText(legend_x + 28, legend_y, text)
-            
+
             self.legend_rects[key] = (legend_x - 5, legend_y - 15, 150, 20)
             legend_y -= 22
 
         if self.filters or self.preamp != 0: draw_legend("eq", "EQ Curve", QColor("#0078D4"))
         if self.measurement_curve: draw_legend("eq_meas", "EQ'd Measurement", QColor(0, 208, 132, 200))
         if self.measurement_curve: draw_legend("raw", "Raw Measurement", QColor(255, 136, 0, 100))
-        
-        # Uses base_color so the target curve dashed line icon isn't invisible
         if self.target_curve: draw_legend("target", "Target Curve", QColor(base_color.red(), base_color.green(), base_color.blue(), 80), is_dashed=True)
         if self.visibility.get("eq", True): draw_legend("ceiling", "Digital Ceiling", QColor(255, 165, 0, 200), is_dashed=True)
 
-    # --- Mouse Events ---
     def mousePressEvent(self, event):
-        if not self.isEnabled(): return # <--- Fix: Ignore input if disabled
+        if not self.isEnabled(): return
         x, y = event.position().x(), event.position().y()
         for key, (rx, ry, rw, rh) in self.legend_rects.items():
             if rx <= x <= rx + rw and ry <= y <= ry + rh:
@@ -319,11 +294,10 @@ class EQGraph(QWidget):
 
         min_dist, best_idx = 400, -1
         for i, f in enumerate(self.filters):
-            if not f.get("enabled", True): continue
             cx, cy = self._f_to_x(f["freq"]), self._db_to_y(f["gain"] + self.preamp)
             dist = (cx-x)**2 + (cy-y)**2
             if dist < min_dist: min_dist, best_idx = dist, i
-                
+
         if best_idx != -1 and min_dist <= 100:
             self.active_idx = best_idx
             self.dragging_idx = best_idx
@@ -336,10 +310,10 @@ class EQGraph(QWidget):
             x, y = event.position().x(), event.position().y()
             f = self.filters[self.dragging_idx]
             new_f, new_g = f["freq"], f["gain"]
-            
+
             if not f.get("lock_freq", False): new_f = max(20, min(20000, self._x_to_f(x)))
             if not f.get("lock_gain", False): new_g = max(-18.0, min(18.0, self._y_to_db(y) - self.preamp))
-                
+
             self.point_moved.emit(self.dragging_idx, new_f, new_g)
 
     def mouseReleaseEvent(self, event):
@@ -353,30 +327,27 @@ class EQGraph(QWidget):
                 delta = event.angleDelta().y() / 120.0
                 new_q = max(0.1, min(18.0, f["q"] + delta * 0.1))
                 self.q_changed.emit(self.active_idx, new_q)
-                
+
 # --- Communicator ---
 class Communicator(QObject):
     sync_finished = Signal(object, object, object)
     status_msg = Signal(str)
-    hw_vol_changed = Signal(int)  # Emitted when physical DAC buttons are pressed
-    
+    hw_vol_changed = Signal(int)
+
 class CustomInputDialog(MessageBoxBase):
-    """ Modern WinUI-styled input dialog """
     def __init__(self, title, content, parent=None):
         super().__init__(parent)
         self.titleLabel = SubtitleLabel(title, self)
         self.contentLabel = BodyLabel(content, self)
         self.lineEdit = LineEdit(self)
-        
+
         self.lineEdit.setPlaceholderText("Enter preset name...")
         self.lineEdit.setClearButtonEnabled(True)
 
-        # Add widgets to the internal WinUI layout
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.contentLabel)
         self.viewLayout.addWidget(self.lineEdit)
 
-        # Set dialog width to match WinUI standards
         self.widget.setMinimumWidth(350)
         self.yesButton.setText("Create")
         self.cancelButton.setText("Cancel")
@@ -385,13 +356,12 @@ class CustomInputDialog(MessageBoxBase):
 class FluentDACController(FluentWindow):
     def __init__(self):
         super().__init__()
-        
+
         self.setWindowTitle("TRN Control Panel")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
-        self.resize(1000, 750) 
+        self.resize(1000, 750)
         self.setMinimumSize(800, 600)
 
-        # 1. Initialize data and variables first
         self.read_results, self.parsed_filters = {}, {}
         self.hw_info = {"Man": "Loading...", "Prod": "Loading...", "SN": "Loading...", "FW": "Loading..."}
         self.is_syncing, self.active_device = False, None
@@ -399,11 +369,10 @@ class FluentDACController(FluentWindow):
         self._updating_ui = False
         self.list_widgets = []
         self.comm = Communicator()
-        self.usb_lock = Lock() 
+        self.usb_lock = Lock()
         self.settings_data = self.load_settings()
         self.actual_sn, self.sn_hidden, self.last_raw_vol = "", True, 0
-        
-        # Restore the dropped variables
+
         self.dirty_usb_tasks = set()
         self.filter_desc_map = {
             "FAST-LL": "Fast roll-off, Low Latency. Best for gaming.",
@@ -412,8 +381,7 @@ class FluentDACController(FluentWindow):
             "SLOW-PC": "Slow roll-off, Phase Compensated. Natural transient response.",
             "NOS": "Non-Oversampling. Purest signal path, high frequency roll-off."
         }
-        
-        # 2. Define the frames BEFORE calling _setup_ui
+
         self.dac_interface = QFrame(self)
         self.eq_interface = QFrame(self)
         self.about_interface = QFrame(self)
@@ -421,92 +389,81 @@ class FluentDACController(FluentWindow):
         self.eq_interface.setObjectName("eq_interface")
         self.about_interface.setObjectName("about_interface")
 
-        # 3. Create the UI
         self._setup_ui()
         self._connect_logic()
 
-        # 4. Native PySide6 OS Hook (Bypasses qfluentwidgets listener bugs)
         app = QApplication.instance()
         if hasattr(app.styleHints(), 'colorSchemeChanged'):
             app.styleHints().colorSchemeChanged.connect(self._force_theme_sync)
         else:
             qconfig.themeChanged.connect(self._on_theme_changed)
 
-        # 5. Apply the Windows Accent Color after the UI is built
         if sys.platform == "win32":
             self._last_accent_color = getSystemAccentColor()
             setThemeColor(self._last_accent_color, save=False)
         else:
             self._last_accent_color = None
 
-        # 6. Initialize Timers
+        self.read_timer = QTimer(self)
+        self.read_timer.timeout.connect(self._poll_read)
+        self.read_timer.start(20)
+
         self.usb_timer = QTimer(self)
         self.usb_timer.setInterval(40)
         self.usb_timer.timeout.connect(self._process_usb_queue)
 
         self.auto_flash_timer = QTimer(self)
         self.auto_flash_timer.setSingleShot(True)
-        self.auto_flash_timer.setInterval(3000) 
+        self.auto_flash_timer.setInterval(3000)
         self.auto_flash_timer.timeout.connect(self._commit_to_flash)
 
         self.conn_timer = QTimer(self)
         self.conn_timer.timeout.connect(self._check_connection)
         self.conn_timer.start(2000)
-        
-        self.conn_timer = QTimer(self)
-        self.conn_timer.timeout.connect(self._check_connection)
-        self.conn_timer.start(2000)
-        
-        # Fast Poller to detect physical DAC button presses
+
         self.vol_poll_timer = QTimer(self)
         self.vol_poll_timer.timeout.connect(self._poll_hw_volume)
         self.vol_poll_timer.start(300)
 
         QTimer.singleShot(500, self.refresh)
-        
+
     def _delete_preset(self):
         idx = self.preset_cb.currentIndex()
         name = self.preset_cb.currentText()
-        
+
         if name == "None":
             InfoBar.warning("Forbidden", "The 'None' preset cannot be deleted.", parent=self)
             return
-            
-        # Confirmation Dialog
+
         title = "Confirm Deletion"
         content = f"Are you sure you want to permanently delete the '{name}' preset?"
-        from qfluentwidgets import MessageBox
         w = MessageBox(title, content, self)
-        w.yesButton.setText("Delete")      
-        w.cancelButton.setText("Keep It") 
+        w.yesButton.setText("Delete")
+        w.cancelButton.setText("Keep It")
         if w.exec():
             self.settings_data["presets"].pop(idx)
             self.preset_cb.removeItem(idx)
-            # Default to index 0 (None)
             self.preset_cb.setCurrentIndex(0)
             self.save_settings()
             InfoBar.success("Deleted", f"Preset '{name}' removed.", parent=self)
-        
+
     def _identify_preset(self, parsed_filters):
-        """Compares live hardware EQ state to saved PC presets."""
         for idx, preset in enumerate(self.settings_data["presets"]):
-            if preset["name"] == "None": 
-                continue # Skip the fallback template
-                
+            if preset["name"] == "None":
+                continue
+
             match = True
             for i in range(10):
                 pf = parsed_filters.get(i, {})
                 sf = preset["filters"][i]
-                
-                # Hardware vs Saved Gain (Treat disabled saved filters as 0.0 gain)
+
                 pg = float(pf.get("gain", 0.0))
                 sg = float(sf.get("gain", 0.0)) if sf.get("enabled", True) else 0.0
-                
+
                 if abs(pg - sg) > 0.1:
                     match = False
                     break
-                    
-                # Only strictly check freq/q/type if the band is actively changing sound (gain != 0)
+
                 if abs(pg) > 0.1 or abs(sg) > 0.1:
                     if abs(float(pf.get("freq", 1000)) - float(sf.get("freq", 1000))) > 1.0:
                         match = False
@@ -520,32 +477,17 @@ class FluentDACController(FluentWindow):
             if match:
                 return idx
         return -1
-        
-        
-    # Add 'theme' parameter to catch the signal data
+
     def _on_theme_changed(self, theme=None):
-        """Forces a full redraw of custom components and graphs when Windows theme changes."""
-        # 1. Update the custom graphs
         self.graph.update()
         self.small_graph.update()
-        
-        # 2. Refresh the window stylesheet to ensure text/icons update
-        # Use QApplication.instance() to safely grab the global app style
         self.setStyle(QApplication.instance().style())
-        
-        # 3. Optional: If you have specific icons that don't change, re-set them here
-        # For example, if your window icon has a light/dark version:
-        # self.setWindowIcon(QIcon(resource_path("icon.ico")))
 
     def _force_theme_sync(self, scheme):
-        """Takes over Auto-Theming directly from the PySide6 engine."""
         is_dark = (scheme == Qt.ColorScheme.Dark)
         setTheme(Theme.DARK if is_dark else Theme.LIGHT)
-        
-        # Re-fetch and apply the new Windows accent color to the widgets
         if sys.platform == "win32":
             setThemeColor(getSystemAccentColor())
-            
         self._on_theme_changed()
 
     def load_settings(self):
@@ -553,57 +495,49 @@ class FluentDACController(FluentWindow):
         default_data = {"balance": 0, "last_preset": 0, "presets": [{"name": "None", "preamp": 0.0, "filters": default_filters}]}
         if os.path.exists(SETTINGS_FILE):
             try:
-                with open(SETTINGS_FILE, "r") as f: 
+                with open(SETTINGS_FILE, "r") as f:
                     data = {**default_data, **json.load(f)}
-                    
-                    # Convert legacy "Default" to "None"
                     for p in data.get("presets", []):
                         if p["name"] == "Default":
                             p["name"] = "None"
-                            
-                    # Ensure "None" exists
+
                     if not any(p["name"] == "None" for p in data.get("presets", [])):
                         data["presets"].insert(0, {"name": "None", "preamp": 0.0, "filters": default_filters})
-                        
+
                     if data.get("last_preset", 0) >= len(data.get("presets", [])):
                         data["last_preset"] = 0
                     return data
             except: pass
         return default_data
-        
 
     def _setup_ui(self):
         self.addSubInterface(self.dac_interface, FluentIcon.SETTING, "DAC Settings")
         self.addSubInterface(self.eq_interface, FluentIcon.MUSIC, "Parametric EQ")
 
-        # --- DAC Interface with Scroll Support ---
         self.dac_scroll = SmoothScrollArea(self.dac_interface)
         self.dac_scroll.setWidgetResizable(True)
         self.dac_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         self.dac_scroll.viewport().setStyleSheet("background: transparent;")
-        
+
         dac_container = QWidget()
         dac_container.setObjectName("dac_container")
-        dac_container.setStyleSheet("#dac_container { background: transparent; }") # Explicitly target the ID
+        dac_container.setStyleSheet("#dac_container { background: transparent; }")
         dac_layout = QVBoxLayout(dac_container)
         dac_layout.setContentsMargins(20, 20, 20, 20)
         dac_layout.setSpacing(2)
-        
-       
 
-        # 1. Hardware Info
         hw_header = QHBoxLayout()
         hw_header.addWidget(SubtitleLabel("Hardware Info", self))
-        
+
         self.refresh_status_lbl_dac = CaptionLabel("", self)
-        
+
         self.dac_refresh_btn = TransparentToolButton(FluentIcon.SYNC, self)
         self.dac_refresh_btn.clicked.connect(self.refresh)
         hw_header.addStretch(1)
         hw_header.addWidget(self.refresh_status_lbl_dac)
         hw_header.addWidget(self.dac_refresh_btn)
         dac_layout.addLayout(hw_header)
-        
+
         info_card = CardWidget(self)
         info_l = QGridLayout(info_card)
         self.lbl_man = BodyLabel("Manufacturer: Loading...", info_card)
@@ -616,10 +550,9 @@ class FluentDACController(FluentWindow):
         info_l.addWidget(self.lbl_fw, 1, 0); info_l.addWidget(self.lbl_sn, 1, 1)
         dac_layout.addWidget(info_card)
 
-         # --- Mic Gain Section ---
         dac_layout.addSpacing(20)
         dac_layout.addWidget(SubtitleLabel("Microphone Settings", self))
-        
+
         mic_card = CardWidget(self)
         mic_l = QVBoxLayout(mic_card)
         mic_header = QHBoxLayout()
@@ -627,32 +560,31 @@ class FluentDACController(FluentWindow):
         self.mic_txt = BodyLabel("0 dB", mic_card)
         mic_header.addStretch(1); mic_header.addWidget(self.mic_txt)
         mic_l.addLayout(mic_header)
-        
+
         self.mic_slider = Slider(Qt.Horizontal, mic_card)
-        self.mic_slider.setRange(-15, 15) # Range from your uploaded script
+        self.mic_slider.setRange(-15, 15)
         self.mic_slider.setValue(0)
         self.mic_slider.valueChanged.connect(self._on_mic_gain_change)
         mic_l.addWidget(self.mic_slider)
         dac_layout.addWidget(mic_card)
 
-        # 2. Audio Settings
         dac_layout.addSpacing(20)
         dac_layout.addWidget(SubtitleLabel("Audio Settings", self))
-        
+
         audio_card = CardWidget(self)
         audio_l = QVBoxLayout(audio_card)
-        
+
         vol_header = QHBoxLayout()
         vol_header.addWidget(StrongBodyLabel("Hardware Volume", audio_card))
         self.vol_txt = BodyLabel("50%", audio_card)
         vol_header.addStretch(1); vol_header.addWidget(self.vol_txt)
         audio_l.addLayout(vol_header)
-        
+
         self.vol_slider = Slider(Qt.Horizontal, audio_card)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.valueChanged.connect(self._on_volume_slider_changed)
         audio_l.addWidget(self.vol_slider)
-        
+
         self.vol_warning_lbl = CaptionLabel("⚠️ Clipping Risk: DAC volume exceeds safe EQ headroom!", audio_card)
         self.vol_warning_lbl.setStyleSheet("color: #ff4d4d; font-weight: bold;"); self.vol_warning_lbl.hide()
         audio_l.addWidget(self.vol_warning_lbl); audio_l.addSpacing(15)
@@ -662,7 +594,7 @@ class FluentDACController(FluentWindow):
         self.bal_txt = BodyLabel("Center", audio_card)
         bal_header.addStretch(1); bal_header.addWidget(self.bal_txt)
         audio_l.addLayout(bal_header)
-        
+
         self.bal_slider = Slider(Qt.Horizontal, audio_card)
         self.bal_slider.setRange(-15, 15)
         self.bal_slider.setValue(self.settings_data["balance"])
@@ -670,83 +602,76 @@ class FluentDACController(FluentWindow):
         audio_l.addWidget(self.bal_slider)
         dac_layout.addWidget(audio_card)
 
-        # 3. DAC Settings
         dac_layout.addSpacing(20)
         dac_layout.addWidget(SubtitleLabel("DAC Settings", self))
 
         self.cb_filter, self.desc_filter = self._create_row(dac_layout, "Digital Filter", FILTER_MAP, 0x11, "Selects the internal DAC reconstruction filter algorithm.")
         self.cb_gain, self.desc_gain = self._create_row(dac_layout, "Gain Mode", GAIN_MAP, 0x19, "Adjusts the amplifier's base volume scaling for sensitive IEMs or demanding headphones.")
         self.cb_amp, self.desc_amp = self._create_row(dac_layout, "Amp Topology", AMP_MAP, 0x1D, "Switches between Class AB (Maximum audio performance) and Class H (Higher power efficiency).")
-        
+
         self.cb_filter.currentTextChanged.connect(lambda t: self.desc_filter.setText(self.filter_desc_map.get(t, "Select a filter.")))
-        
-        # 4. Factory Reset
+
         dac_layout.addSpacing(20)
         dac_layout.addWidget(SubtitleLabel("Factory Reset", self))
-        
+
         reset_card = SimpleCardWidget(self)
         reset_layout = QHBoxLayout(reset_card)
         reset_layout.setContentsMargins(16, 16, 16, 16)
         reset_layout.setAlignment(Qt.AlignVCenter)
-        
+
         reset_text = QVBoxLayout()
         reset_text.setSpacing(4)
         reset_text.setAlignment(Qt.AlignVCenter)
         reset_text.addWidget(StrongBodyLabel("Reset System", reset_card))
-        
+
         reset_desc = CaptionLabel("Restore all device settings to factory defaults.", reset_card)
         reset_desc.setTextColor(QColor(150, 150, 150))
         reset_text.addWidget(reset_desc)
-        
+
         reset_layout.addLayout(reset_text)
         reset_layout.addStretch(1)
-        
+
         self.btn_factory_reset = PushButton("Reset Device", reset_card)
         self.btn_factory_reset.clicked.connect(self._factory_reset)
         self.btn_factory_reset.setFixedWidth(220)
         reset_layout.addWidget(self.btn_factory_reset)
-        
+
         dac_layout.addWidget(reset_card)
         dac_layout.addStretch(1)
         self.dac_scroll.setWidget(dac_container)
-        
-        # Set the main layout for the interface frame
+
         main_dac_layout = QVBoxLayout(self.dac_interface)
         main_dac_layout.setContentsMargins(0, 0, 0, 0)
         main_dac_layout.addWidget(self.dac_scroll)
 
-        # --- EQ Interface ---
         eq_layout = QVBoxLayout(self.eq_interface); eq_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         header_frame = QWidget(self)
         header_l = QVBoxLayout(header_frame)
-        
-        # Reduced top margin from 20 to 10 and vertical spacing from 12 to 8
         header_l.setContentsMargins(15, 10, 15, 0)
         header_l.setSpacing(8)
 
-        # --- Row 1: Core EQ Controls ---
         top_bar = QHBoxLayout()
-        top_bar.setSpacing(8) # Tightens the gap between buttons/combo boxes
+        top_bar.setSpacing(8)
         top_bar.addWidget(SubtitleLabel("Parametric EQ", header_frame))
         top_bar.addStretch(1)
-        
+
         self.btn_toggle_view = PushButton("List View", header_frame)
         self.btn_toggle_view.clicked.connect(self._toggle_view)
         top_bar.addWidget(self.btn_toggle_view)
-        
+
         top_bar.addWidget(CaptionLabel("Preset:", header_frame))
         self.preset_cb = ComboBox(header_frame)
         self.preset_cb.addItems([p["name"] for p in self.settings_data["presets"]])
         self.preset_cb.setCurrentIndex(self.settings_data["last_preset"])
         self.preset_cb.currentIndexChanged.connect(self._load_preset_ui)
         top_bar.addWidget(self.preset_cb)
-        
+
         self.btn_add = TransparentToolButton(FluentIcon.ADD, header_frame)
         self.btn_add.setToolTip("Create New Preset")
         self.btn_add.clicked.connect(self._new_preset)
         top_bar.addWidget(self.btn_add)
-        
+
         self.btn_delete = TransparentToolButton(FluentIcon.DELETE, header_frame)
         self.btn_delete.setToolTip("Delete Current Preset")
         self.btn_delete.clicked.connect(self._delete_preset)
@@ -757,11 +682,8 @@ class FluentDACController(FluentWindow):
         top_bar.addWidget(self.btn_reset)
 
         header_l.addLayout(top_bar)
-        
-        # --- Row 2: File Operations (Clean Layout) ---
+
         io_bar = QHBoxLayout()
-        
-        # 1. Left Group: Custom Measurements/Targets
         self.btn_import_meas = PushButton(FluentIcon.MICROPHONE, "Import Measurement", header_frame)
         self.btn_import_meas.clicked.connect(self._import_measurement)
         io_bar.addWidget(self.btn_import_meas)
@@ -770,11 +692,10 @@ class FluentDACController(FluentWindow):
         self.btn_import_target.clicked.connect(self._import_rew_target)
         io_bar.addWidget(self.btn_import_target)
 
-        io_bar.addStretch(1) # Pushes AutoEQ to the far right
+        io_bar.addStretch(1)
 
-        # 2. Right Group: AutoEQ (No Refresh Icon)
         io_bar.addWidget(CaptionLabel("AutoEQ Config:", header_frame))
-        
+
         self.btn_import = PushButton(FluentIcon.DOWNLOAD, "Import", header_frame)
         self.btn_import.clicked.connect(self._import_squig)
         io_bar.addWidget(self.btn_import)
@@ -783,52 +704,46 @@ class FluentDACController(FluentWindow):
         self.btn_export.clicked.connect(self._export_autoeq)
         io_bar.addWidget(self.btn_export)
 
-        header_l.addSpacing(4) 
-        io_bar.setSpacing(8) 
+        header_l.addSpacing(4)
+        io_bar.setSpacing(8)
         header_l.addLayout(io_bar)
-        
-        # EQ Tab Volume Card
+
         eq_vol_card = SimpleCardWidget(header_frame)
         eq_vol_l = QVBoxLayout(eq_vol_card)
-        eq_vol_l.setContentsMargins(10, 9, 10, 9) # Tighter internal padding
+        eq_vol_l.setContentsMargins(10, 9, 10, 9)
 
-        # Top row for Title, Warning, and Percentage
         eq_vol_top = QHBoxLayout()
         eq_vol_top.addWidget(StrongBodyLabel("Master Volume", eq_vol_card))
-        
+
         self.eq_vol_warning_lbl = CaptionLabel("  ⚠️ Clipping Risk!", eq_vol_card)
         self.eq_vol_warning_lbl.setStyleSheet("color: #ff4d4d; font-weight: bold;")
         self.eq_vol_warning_lbl.hide()
         eq_vol_top.addWidget(self.eq_vol_warning_lbl)
-        
-        eq_vol_top.addStretch(1) # Pushes the percentage text to the far right
-        
+
+        eq_vol_top.addStretch(1)
+
         self.eq_vol_txt = BodyLabel("50%", eq_vol_card)
         eq_vol_top.addWidget(self.eq_vol_txt)
-        
+
         eq_vol_l.addLayout(eq_vol_top)
 
-        # Bottom row dedicated entirely to the slider
         self.eq_vol_slider = Slider(Qt.Horizontal, eq_vol_card)
         self.eq_vol_slider.setRange(0, 100)
         self.eq_vol_slider.valueChanged.connect(self._on_volume_slider_changed)
-        
+
         eq_vol_l.addWidget(self.eq_vol_slider)
 
-        # Add a small negative spacing if necessary, or just keep it tight
-        header_l.addSpacing(-4) 
+        header_l.addSpacing(-4)
         header_l.addWidget(eq_vol_card)
         eq_layout.addWidget(header_frame)
         eq_layout.setSpacing(0)
 
-        # STACKED WIDGET FOR VIEWS
         self.stack = QStackedWidget(self)
         eq_layout.addWidget(self.stack, 1)
 
-        # --- VIEW 0: Graph UI ---
         self.graph_page = QWidget()
         graph_layout = QVBoxLayout(self.graph_page); graph_layout.setContentsMargins(15, 0, 15, 20)
-        
+
         self.graph = EQGraph(self.graph_page)
         self.graph.setMinimumHeight(350)
         self.graph.point_moved.connect(self._on_graph_point_moved)
@@ -843,7 +758,7 @@ class FluentDACController(FluentWindow):
 
         self.band_lbl = StrongBodyLabel("Band 1", self.active_band_card); bl.addWidget(self.band_lbl)
         self.band_enable = CheckBox(self.active_band_card); self.band_enable.setFixedWidth(30); bl.addWidget(self.band_enable)
-        
+
         self.band_type = ComboBox(self.active_band_card); self.band_type.addItems(["PK", "LS", "HS"]); self.band_type.setFixedWidth(80); bl.addWidget(self.band_type)
         self.band_freq = LineEdit(self.active_band_card); self.band_freq.setFixedWidth(65); bl.addWidget(self.band_freq); bl.addWidget(CaptionLabel("Hz", self.active_band_card))
         self.lock_freq = CheckBox("Lock", self.active_band_card)
@@ -858,15 +773,10 @@ class FluentDACController(FluentWindow):
         self.lock_q = CheckBox("Lock", self.active_band_card)
         bl.addWidget(self.lock_q)
 
-        
-        
         graph_layout.addWidget(self.active_band_card)
         self.stack.addWidget(self.graph_page)
 
-        # --- VIEW 1: List UI ---
-        # --- VIEW 1: List UI ---
         self.list_page = QWidget()
-        # Horizontal margins changed to 15 to match top bar
         list_page_layout = QVBoxLayout(self.list_page); list_page_layout.setContentsMargins(15, 10, 15, 10)
 
         self.small_graph = EQGraph(self.list_page)
@@ -879,60 +789,52 @@ class FluentDACController(FluentWindow):
         scroll = SmoothScrollArea(self.list_page); scroll.setWidgetResizable(True); scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         scroll.viewport().setStyleSheet("background: transparent;")
         list_container = QWidget(); list_container.setStyleSheet("background: transparent;")
-        
-        # Margins and spacing set to 0 to stack bands perfectly
+
         self.bands_layout = QVBoxLayout(list_container)
-        self.bands_layout.setContentsMargins(0, 0, 0, 0)
-        self.bands_layout.setSpacing(0)
-        # Set margins and spacing to 0 to remove all gaps between the rows
         self.bands_layout.setContentsMargins(0, 0, 0, 0)
         self.bands_layout.setSpacing(0)
 
         for i in range(10):
             band_card = SimpleCardWidget(list_container)
-            # Set fixed height and bottom-only border for clean stacking
             band_card.setFixedHeight(50)
-            # Remove the rgba(255, 255, 255...) to let the theme handle the line color
             band_card.setStyleSheet("SimpleCardWidget { background: transparent; border: none; border-bottom: 1px solid rgba(128, 128, 128, 0.2); }")
-            
+
             lbl_layout = QHBoxLayout(band_card)
             lbl_layout.setContentsMargins(10, 0, 10, 0)
             lbl_layout.setSpacing(8)
-            
-            # FIXED WIDTH for index label prevents "10" from pushing other widgets
+
             band_num_lbl = StrongBodyLabel(f"{i+1}", band_card)
-            band_num_lbl.setFixedWidth(20) 
+            band_num_lbl.setFixedWidth(20)
             lbl_layout.addWidget(band_num_lbl)
-            
+
             chk = CheckBox(band_card); chk.setFixedWidth(30)
             typ = ComboBox(band_card); typ.addItems(["PK", "LS", "HS"]); typ.setFixedWidth(80)
             freq = LineEdit(band_card); freq.setFixedWidth(65)
-            
+
             lbl_layout.addWidget(chk); lbl_layout.addWidget(typ); lbl_layout.addWidget(freq); lbl_layout.addWidget(CaptionLabel("Hz", band_card))
-            
+
             sld, gain = Slider(Qt.Horizontal, band_card), LineEdit(band_card)
             sld.setRange(-100, 100); gain.setFixedWidth(60)
-            
-            lbl_layout.addWidget(sld, 1) # This expands to fill the middle space
+
+            lbl_layout.addWidget(sld, 1)
             lbl_layout.addWidget(gain); lbl_layout.addWidget(CaptionLabel("dB", band_card))
-            
+
             qv = LineEdit(band_card); qv.setFixedWidth(45)
             lbl_layout.addSpacing(15); lbl_layout.addWidget(CaptionLabel("Q:", band_card)); lbl_layout.addWidget(qv)
-            
+
             chk.stateChanged.connect(lambda _, idx=i: self._on_list_ui_changed(idx))
             typ.currentIndexChanged.connect(lambda _, idx=i: self._on_list_ui_changed(idx))
             sld.valueChanged.connect(lambda v, idx=i, le=gain: [le.setText(str(v/10)), self._on_list_ui_changed(idx)])
             gain.editingFinished.connect(lambda s=sld, le=gain: s.setValue(int(float(le.text().replace(',', '.') or 0) * 10)))
             freq.editingFinished.connect(lambda idx=i: self._on_list_ui_changed(idx))
             qv.editingFinished.connect(lambda idx=i: self._on_list_ui_changed(idx))
-            
+
             self.list_widgets.append({"enabled": chk, "type": typ, "freq": freq, "gain": gain, "q": qv, "slider": sld})
             self.bands_layout.addWidget(band_card)
-            
+
         scroll.setWidget(list_container); list_page_layout.addWidget(scroll)
         self.stack.addWidget(self.list_page)
 
-        # Visual UI Logic Bindings
         self.band_enable.stateChanged.connect(self._on_visual_ui_changed)
         self.band_type.currentIndexChanged.connect(self._on_visual_ui_changed)
         self.band_freq.editingFinished.connect(self._on_visual_ui_changed)
@@ -943,104 +845,113 @@ class FluentDACController(FluentWindow):
         self.lock_gain.stateChanged.connect(self._on_visual_ui_changed)
         self.lock_q.stateChanged.connect(self._on_visual_ui_changed)
 
-        # --- About Interface (Fluent UI Card) ---
-        about_layout = QVBoxLayout(self.about_interface)
-        about_layout.setAlignment(Qt.AlignCenter)
-        
+        about_interface_layout = QVBoxLayout(self.about_interface)
+        about_interface_layout.setAlignment(Qt.AlignCenter)
+
         about_card = CardWidget(self.about_interface)
         about_card.setFixedSize(400, 250)
         card_layout = QVBoxLayout(about_card)
         card_layout.setAlignment(Qt.AlignCenter)
         card_layout.setSpacing(15)
-        
+
         icon_btn = TransparentToolButton(about_card)
         icon_btn.setIcon(QIcon(resource_path("icon.ico")))
         icon_btn.setIconSize(QSize(64, 64))
         card_layout.addWidget(icon_btn, 0, Qt.AlignCenter)
-        
+
         card_layout.addWidget(SubtitleLabel("TRN Control Panel", about_card), 0, Qt.AlignCenter)
-        
+
         author_lbl = BodyLabel("by KDRN", about_card)
         author_lbl.setTextColor(QColor(150, 150, 150))
         card_layout.addWidget(author_lbl, 0, Qt.AlignCenter)
-        
-        about_layout.addWidget(about_card)
-        
+
+        about_interface_layout.addWidget(about_card)
+
         self.addSubInterface(self.about_interface, FluentIcon.INFO, "About", position=NavigationItemPosition.BOTTOM)
 
         self._sync_all_uis()
         self.toggle_controls(False)
 
-    # --- UI Logic Methods ---
     def _toggle_sn(self, event):
         if not self.actual_sn: return
         self.sn_hidden = not self.sn_hidden
         self.lbl_sn.setText(f"Serial: {'********' if self.sn_hidden else self.actual_sn}")
 
     def _poll_hw_volume(self):
-        """Only polls when the user is NOT interacting with the app"""
-        # If the USB queue is active (slider moving), skip polling to save bandwidth
-        if self.is_syncing or self.usb_timer.isActive(): 
+        if self.is_syncing or self.usb_timer.isActive():
             return
-            
+
         with self.usb_lock:
             dev = self.get_device()
             if dev:
-                try: dev.find_output_reports()[0].send([REPORT_ID, READ, CMD_GLOBAL_GAIN, END] + [0x00]*60)
+                try:
+                    # Pad to EXACTLY 65 bytes (1 ID + 64 Data)
+                    dev.write([REPORT_ID, READ, CMD_GLOBAL_GAIN, END] + [0x00]*61)
                 except: pass
 
+    def _poll_read(self):
+        if not self.active_device:
+            return
+        with self.usb_lock:
+            try:
+                while True:
+                    # Bumped to 128 bytes so Linux hidraw gets the full packet without truncation
+                    data = self.active_device.read(128)
+                    if not data:
+                        break
+                    self.on_data(data)
+            except Exception:
+                # If reading throws an OS error, the DAC was violently unplugged.
+                try: self.active_device.close()
+                except: pass
+                self.active_device = None
+                if self.lbl_sn.text() != "Serial: Disconnected":
+                    self.comm.status_msg.emit("Disconnected")
+
     def _sync_hw_volume_ui(self, raw_vol):
-        """Triggered when you press a button on the DAC"""
-        # Decouple: Ignore the DAC's reported volume if the PC is actively sending volume commands
         if self.usb_timer.isActive() or -1 in self.dirty_usb_tasks:
             return
-            
+
         self.last_raw_vol = raw_vol
         self._check_headroom(auto_level=False)
 
     def _check_headroom(self, auto_level=False):
-        # Calculate available digital ceiling based on current volume
         ceiling_db = (VOL_MAX_RAW - self.last_raw_vol) / UNITS_PER_DB
         self.graph.headroom_db = ceiling_db
         self.small_graph.headroom_db = ceiling_db
-        
+
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
         active_filters = [f for f in p["filters"] if f.get("enabled", True)]
         active_coeffs = [_calc_coeffs(f["type"], f["freq"], f["q"], f["gain"]) for f in active_filters]
-        
-        # Accurately find the max EQ peak by checking standard frequencies PLUS the exact center of every active band
+
         max_db = 0.0
         if active_coeffs:
             freqs_to_check = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
             freqs_to_check.extend([f.get("freq", 1000) for f in active_filters])
-            
+
             for f_hz in freqs_to_check:
                 max_db = max(max_db, sum(biquad_response(c, f_hz) for c in active_coeffs))
-                
+
         safe_max = VOL_MAX_RAW - int(max(0, max_db) * UNITS_PER_DB)
-        
-        # Auto-level volume if EQ is modified and causes clipping
+
         if auto_level and self.last_raw_vol > safe_max:
             self.last_raw_vol = safe_max
-            self._apply_filter(-1) # <-- FIX: Queue the new safe volume to physically send to the DAC!
-            
+            self._apply_filter(-1)
+
         is_clipping = self.last_raw_vol > safe_max
-        
-        # Update Visuals
+
         self.graph.is_clipping = is_clipping
         self.small_graph.is_clipping = is_clipping
         self.vol_warning_lbl.setVisible(is_clipping)
         self.eq_vol_warning_lbl.setVisible(is_clipping)
-        
+
         style = "QSlider::handle { background: #ff4d4d; }" if is_clipping else ""
         self.vol_slider.setStyleSheet(style)
         self.eq_vol_slider.setStyleSheet(style)
-        
-        # Force the graphs to redraw the orange headroom line
+
         self.graph.update()
         self.small_graph.update()
-        
-        # Sync Slider UI
+
         pct = max(0, min(100, int(((self.last_raw_vol - VOL_MIN_RAW) / (VOL_MAX_RAW - VOL_MIN_RAW)) * 100)))
         self._updating_ui = True
         self.vol_slider.setValue(pct); self.vol_txt.setText(f"{pct}%")
@@ -1049,34 +960,21 @@ class FluentDACController(FluentWindow):
 
     def _on_volume_slider_changed(self, pos):
         if self._updating_ui or self.is_syncing: return
-        
-        # 1. Update the raw hardware math based on the slider position
         self.last_raw_vol = int(VOL_MIN_RAW + (pos / 100.0) * (VOL_MAX_RAW - VOL_MIN_RAW))
-        
-        # 2. Check headroom (This automatically syncs the sliders and text visually)
         self._check_headroom(auto_level=False)
-        
-        # 3. Queue the USB command silently in the background
         self._apply_filter(-1)
 
     def _factory_reset(self):
         if self.is_syncing: return
-        
-        # 1. Reset DAC Settings
+
         self.bal_slider.setValue(0)
         self.cb_filter.setCurrentText("Fast-PC (BEST)")
         self.cb_gain.setCurrentText("LOW")
         self.cb_amp.setCurrentText("CLASS H")
-        
-        # 2. Reset Mic Gain to 0 dB
-        self.mic_slider.setValue(0) # This triggers _on_mic_gain_change automatically
-        
-        # 3. Reset PEQ and Preamp
-        self._reset_eq() 
-        
-        # 4. Commit all changes to hardware flash
+        self.mic_slider.setValue(0)
+        self._reset_eq()
         self._commit_to_flash()
-    
+
         InfoBar.success("Factory Reset", "All settings, including Mic Gain, restored to defaults.", parent=self)
 
     def _on_preamp_slider_changed(self, v):
@@ -1085,7 +983,7 @@ class FluentDACController(FluentWindow):
         self.preamp_val.setText(str(int(val)))
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
         p["preamp"] = val
-        
+
         self.graph.update_data(p["filters"], self.active_band_idx, val)
         self.small_graph.update_data(p["filters"], self.active_band_idx, val)
         self._apply_filter(-1)
@@ -1114,13 +1012,11 @@ class FluentDACController(FluentWindow):
     def _sync_all_uis(self, update_idx=None):
         self._updating_ui = True
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
-        
-        # Optimization: Only update the UI elements for the specific band being dragged
+
         indices = range(10) if update_idx is None else [update_idx]
-        
+
         for idx in indices:
             f = p["filters"][idx]
-            
             lw = self.list_widgets[idx]
             lw["enabled"].setChecked(f.get("enabled", True))
             lw["type"].setCurrentText(f.get("type", "PK"))
@@ -1128,7 +1024,7 @@ class FluentDACController(FluentWindow):
             lw["slider"].setValue(int(f.get("gain", 0) * 10))
             lw["gain"].setText(str(round(f.get("gain", 0), 1)))
             lw["q"].setText(str(round(f.get("q", 1.0), 2)))
-            
+
             if idx == self.active_band_idx:
                 self.band_lbl.setText(f"Band {idx+1}")
                 self.band_enable.setChecked(f.get("enabled", True))
@@ -1140,34 +1036,33 @@ class FluentDACController(FluentWindow):
                 self.lock_freq.setChecked(f.get("lock_freq", False))
                 self.lock_gain.setChecked(f.get("lock_gain", False))
                 self.lock_q.setChecked(f.get("lock_q", False))
-                
+
         self.graph.update_data(p["filters"], self.active_band_idx, 0.0)
         self.small_graph.update_data(p["filters"], self.active_band_idx, 0.0)
         self._updating_ui = False
-        self._check_headroom(auto_level=True) # Check headroom after syncing UI
+        self._check_headroom(auto_level=True)
 
     def _on_visual_ui_changed(self, *_):
         if self._updating_ui: return
         idx = self.active_band_idx
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
         f = p["filters"][idx]
-        
+
         f["enabled"] = self.band_enable.isChecked()
         f["type"] = self.band_type.currentText()
         try: f["freq"] = max(20, min(20000, int(self.band_freq.text())))
         except: pass
-        
+
         f["gain"] = self.band_gain_sld.value() / 10.0
         self.band_gain_val.setText(str(f["gain"]))
-        
-        # Remove the hardcoded 0.1 and read the value from the UI
+
         try: f["q"] = max(0.1, min(18.0, float(self.band_q_val.text().replace(',', '.'))))
         except: pass
-        
+
         f["lock_freq"] = self.lock_freq.isChecked()
         f["lock_gain"] = self.lock_gain.isChecked()
         f["lock_q"] = self.lock_q.isChecked()
-        
+
         self._sync_all_uis(update_idx=idx)
         self._apply_filter(idx)
         self.save_settings()
@@ -1177,7 +1072,7 @@ class FluentDACController(FluentWindow):
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
         f = p["filters"][idx]
         lw = self.list_widgets[idx]
-        
+
         f["enabled"] = lw["enabled"].isChecked()
         f["type"] = lw["type"].currentText()
         try: f["freq"] = max(20, min(20000, int(lw["freq"].text())))
@@ -1185,14 +1080,14 @@ class FluentDACController(FluentWindow):
         f["gain"] = lw["slider"].value() / 10.0
         try: f["q"] = max(0.1, min(18.0, float(lw["q"].text())))
         except: pass
-        
+
         self._sync_all_uis(update_idx=idx)
         self._apply_filter(idx)
         self.save_settings()
-        
+
     def _on_gain_val_edited(self):
         if self._updating_ui: return
-        try: 
+        try:
             val = float(self.band_gain_val.text().replace(',', '.'))
             self.band_gain_sld.setValue(int(val * 10))
         except: pass
@@ -1200,24 +1095,19 @@ class FluentDACController(FluentWindow):
     def _on_graph_point_moved(self, idx, freq, gain):
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
         f = p["filters"][idx]
-        f["freq"] = max(20, min(20000, freq)) 
+        f["freq"] = max(20, min(20000, freq))
         f["gain"] = max(-10.0, min(10.0, gain))
-        
-        # This tells the graph to re-cache and re-draw instantly
-        self.graph.update_data(p["filters"], self.active_band_idx, 0.0)
-        self.small_graph.update_data(p["filters"], self.active_band_idx, 0.0)
-        
-        if idx == self.active_band_idx:
-            self.band_freq.setText(str(int(f["freq"])))
-            self.band_gain_val.setText(str(round(f["gain"], 1)))
-            self.band_gain_sld.setValue(int(f["gain"] * 10))
+        f["enabled"] = True
 
+        # Safely updates all textboxes/sliders without triggering disk writes
+        self._sync_all_uis(update_idx=idx)
         self._apply_filter(idx)
 
     def _on_graph_q_changed(self, idx, q):
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
         f = p["filters"][idx]
         f["q"] = q
+        f["enabled"] = True
         self._sync_all_uis(update_idx=idx)
         self._apply_filter(idx)
 
@@ -1265,32 +1155,43 @@ class FluentDACController(FluentWindow):
         except Exception as e:
             InfoBar.error("Error", f"Failed to load file: {e}", parent=self)
 
-    # --- Hardware & Application Logic ---
     def _check_connection(self):
-        # 1. Live Windows Accent Color Tracking
         if sys.platform == "win32":
             current_color = getSystemAccentColor()
             if current_color != self._last_accent_color:
                 self._last_accent_color = current_color
                 setThemeColor(current_color, save=False)
-                # Force widgets to recompile their stylesheets with the new color
                 self._on_theme_changed()
 
-        # 2. USB Connection Logic
-        dev = self.get_device()
-        if not dev and self.lbl_sn.text() != "Serial: Disconnected":
-            self.comm.status_msg.emit("Disconnected")
-        elif dev and self.lbl_sn.text() == "Serial: Disconnected":
-            self.refresh()
+        if self.is_syncing:
+            return
+
+        try:
+            attached = any(d['vendor_id'] == VID and d['product_id'] == PID for d in hid.enumerate())
+        except:
+            attached = False
+
+        if not attached:
+            with self.usb_lock:
+                if self.active_device:
+                    try: self.active_device.close()
+                    except: pass
+                    self.active_device = None
+            if self.lbl_sn.text() != "Serial: Disconnected":
+                self.comm.status_msg.emit("Disconnected")
+        else:
+            if not self.active_device:
+                # Add a 500ms delay so Linux udev / Windows driver can finish mounting
+                QTimer.singleShot(500, self.refresh)
 
     def toggle_controls(self, enabled):
-        objs = [self.vol_slider, self.eq_vol_slider, self.bal_slider, self.cb_filter, 
-                self.cb_gain, self.cb_amp, self.preset_cb, 
-                self.btn_reset, self.btn_add, self.btn_delete, 
+        objs = [self.vol_slider, self.eq_vol_slider, self.bal_slider, self.cb_filter,
+                self.cb_gain, self.cb_amp, self.preset_cb,
+                self.btn_reset, self.btn_add, self.btn_delete,
                 self.btn_import_meas, self.btn_import_target,
                 self.btn_import, self.btn_export, self.graph, self.small_graph,
                 self.btn_toggle_view, self.active_band_card,
-                self.band_enable, self.band_type, self.band_freq, self.band_gain_sld, 
+                self.band_enable, self.band_type, self.band_freq, self.band_gain_sld,
                 self.band_gain_val, self.band_q_val, self.lock_freq, self.lock_gain, self.lock_q,
                 self.btn_factory_reset, self.mic_slider]
         for o in objs: o.setEnabled(enabled)
@@ -1302,45 +1203,38 @@ class FluentDACController(FluentWindow):
         main_layout = QHBoxLayout(card)
         main_layout.setContentsMargins(16, 15, 16, 15)
         main_layout.setAlignment(Qt.AlignVCenter)
-        
+
         text_layout = QVBoxLayout()
         text_layout.setSpacing(4)
         text_layout.setAlignment(Qt.AlignVCenter)
         text_layout.addWidget(StrongBodyLabel(title, card))
-        
+
         desc_lbl = CaptionLabel(default_desc, card)
         desc_lbl.setTextColor(QColor(150, 150, 150))
         text_layout.addWidget(desc_lbl)
-        
+
         main_layout.addLayout(text_layout)
         main_layout.addStretch(1)
-        
+
         cb = ComboBox(card); cb.addItems(list(mapping.values())); cb.setFixedWidth(220)
         cb.currentIndexChanged.connect(lambda: self.write_val(cmd, cb.currentText(), mapping))
         main_layout.addWidget(cb)
-        
+
         layout.addWidget(card)
         return cb, desc_lbl
 
     def get_device(self):
-        # Keeps the device permanently open to prevent pywinusb queue crashes
-        if self.active_device and self.active_device.is_plugged():
-            if not self.active_device.is_opened():
-                try: 
-                    self.active_device.open()
-                    self.active_device.set_raw_data_handler(self.on_data)
-                except: pass
+        if self.active_device:
             return self.active_device
-            
-        devs = hid.HidDeviceFilter(vendor_id=VID, product_id=PID).get_devices()
-        if devs: 
-            self.active_device = devs[0]
-            try:
-                self.active_device.open()
-                self.active_device.set_raw_data_handler(self.on_data)
-            except: pass
-        else: self.active_device = None
-        return self.active_device
+        try:
+            dev = hid.device()
+            dev.open(VID, PID)
+            dev.set_nonblocking(True)
+            self.active_device = dev
+            return self.active_device
+        except Exception:
+            self.active_device = None
+        return None
 
     def refresh(self):
         if self.is_syncing: return
@@ -1350,51 +1244,60 @@ class FluentDACController(FluentWindow):
         self.parsed_filters.clear()
 
         def run():
-            with self.usb_lock:
-                dev = self.get_device()
-                if not dev: 
-                    self.is_syncing = False
-                    return
+            dev = self.get_device()
+            if not dev:
+                self.is_syncing = False
+                return
 
-                try:
-                    report = dev.find_output_reports()[0]
-                    
-                    def send_and_wait(pkt, key, timeout=0.15, is_peq=False):
-                        report.send(pkt)
-                        start = time.time()
-                        while time.time() - start < timeout:
-                            if is_peq and key in self.parsed_filters: return True
-                            if not is_peq and key in self.read_results: return True
-                            time.sleep(0.01)
-                        return False
+            try:
+                def send_and_wait(pkt, key, timeout=0.15, is_peq=False):
+                    # Only hold the lock for the instantaneous write
+                    with self.usb_lock:
+                        try:
+                            dev.write(pkt)
+                        except: pass
 
-                    tasks = [
-                        ([REPORT_ID, READ, CMD_VERSION, END] + [0x00]*60, CMD_VERSION),
-                        ([REPORT_ID, READ, 0x11, END] + [0x00]*60, 0x11),
-                        ([REPORT_ID, READ, 0x19, END] + [0x00]*60, 0x19),
-                        ([REPORT_ID, READ, 0x1D, END] + [0x00]*60, 0x1D),
-                        ([REPORT_ID, READ, CMD_GLOBAL_GAIN, END] + [0x00]*60, CMD_GLOBAL_GAIN),
-                        ([REPORT_ID, READ, 0x02, 0x02] + [0x00]*60, "mic_gain"),
-                        ([REPORT_ID, READ, 0x16, 0x04, 0x01, 0x00, 0x00] + [0x00]*57, "bal_l"),
-                        ([REPORT_ID, READ, 0x16, 0x04, 0x00, 0x00, 0x00] + [0x00]*57, "bal_r"),
-                    ]
+                    # Wait without holding the lock so _poll_read can receive data
+                    start = time.time()
+                    while time.time() - start < timeout:
+                        if is_peq and key in self.parsed_filters: return True
+                        if not is_peq and key in self.read_results: return True
+                        time.sleep(0.01)
+                    return False
 
-                    for pkt, key in tasks:
-                        for _ in range(2): 
-                            if send_and_wait(pkt, key): break
+                def pad(p): return p + [0x00] * (65 - len(p))
 
-                    for i in range(10):
-                        pkt = [REPORT_ID, READ, CMD_PEQ_VALUES, 0x00, 0x00, i, END] + [0x00]*57
-                        for _ in range(2):
-                            if send_and_wait(pkt, i, is_peq=True): break
+                tasks = [
+                    (pad([REPORT_ID, READ, CMD_VERSION, END]), CMD_VERSION),
+                    (pad([REPORT_ID, READ, 0x11, END]), 0x11),
+                    (pad([REPORT_ID, READ, 0x19, END]), 0x19),
+                    (pad([REPORT_ID, READ, 0x1D, END]), 0x1D),
+                    (pad([REPORT_ID, READ, CMD_GLOBAL_GAIN, END]), CMD_GLOBAL_GAIN),
+                    (pad([REPORT_ID, READ, 0x02, 0x02]), "mic_gain"),
+                    (pad([REPORT_ID, READ, 0x16, 0x04, 0x01, 0x00, 0x00]), "bal_l"),
+                    (pad([REPORT_ID, READ, 0x16, 0x04, 0x00, 0x00, 0x00]), "bal_r"),
+                ]
 
-                    self.comm.sync_finished.emit({"SN": dev.serial_number}, self.read_results, self.parsed_filters)
-                except Exception as e: print(f"Sync error: {e}")
-                finally:
-                    self.is_syncing = False
-                    self.refresh_status_lbl_dac.setText("")
+                for pkt, key in tasks:
+                    for _ in range(2):
+                        if send_and_wait(pkt, key): break
+
+                for i in range(10):
+                    pkt = pad([REPORT_ID, READ, CMD_PEQ_VALUES, 0x00, 0x00, i, END])
+                    for _ in range(2):
+                        if send_and_wait(pkt, i, is_peq=True): break
+
+                with self.usb_lock:
+                    sn = dev.get_serial_number_string() or "Unknown"
+
+                self.comm.sync_finished.emit({"SN": sn}, self.read_results, self.parsed_filters)
+            except Exception as e: print(f"Sync error: {e}")
+            finally:
+                self.is_syncing = False
+                self.refresh_status_lbl_dac.setText("")
+
         Thread(target=run, daemon=True).start()
-        
+
     def on_data(self, data):
         if data[0] == REPORT_ID and data[1] == READ:
             cmd = data[2]
@@ -1406,27 +1309,25 @@ class FluentDACController(FluentWindow):
                 g_raw = data[32]|(data[33]<<8)
                 if g_raw > 32767: g_raw -= 65536
                 g = round(g_raw/256.0, 1)
-                
-                # SNAP LOGIC: Kill ghost gains below 0.25dB
+
                 if abs(g) < 0.25: g = 0.0
-                
+
                 self.parsed_filters[idx] = {"freq": f, "q": q, "gain": g, "type": INV_TYPE_CODES.get(data[34], "PK")}
                 self.active_slot = data[36]
-            elif cmd == CMD_GLOBAL_GAIN: 
+            elif cmd == CMD_GLOBAL_GAIN:
                 raw_vol = struct.unpack("<h", bytes(data[4:6]))[0]
                 self.read_results[cmd] = struct.unpack("b", bytes([data[6]]))[0]
-                
+
                 if self.is_syncing:
                     self.last_raw_vol = raw_vol
                 elif raw_vol != getattr(self, 'last_raw_vol', 0) and not getattr(self, '_updating_ui', False):
                     self.comm.hw_vol_changed.emit(raw_vol)
-            elif cmd == 0x16: # <--- New Balance Logic
+            elif cmd == 0x16:
                 sf, mag = data[4], data[6]
-                if sf == 0x01: 
+                if sf == 0x01:
                     self.read_results["bal_l"] = (mag - 256) if mag > 0 else 0
-                else: 
+                else:
                     self.read_results["bal_r"] = (256 - mag) if mag > 0 else 0
-            # Parse Mic Gain response: 4b 80 02 02
             elif cmd == 0x02 and data[3] == 0x02:
                 self.read_results["mic_gain"] = struct.unpack('b', bytes([data[5]]))[0]
             else: self.read_results[cmd] = data[4]
@@ -1446,16 +1347,14 @@ class FluentDACController(FluentWindow):
     def update_ui_state(self, info, results, filters):
         self.is_syncing = True
         self._updating_ui = True
-        
-        # 1. Update Hardware Info
+
         self.lbl_man.setText("Manufacturer: TRN")
         self.lbl_prod.setText("Product: Black Pearl(TE-C)")
         self.actual_sn = info.get('SN', 'Unknown')
         self.lbl_sn.setText(f"Serial: {'********' if self.sn_hidden else self.actual_sn}")
         self.lbl_fw.setText(f"Firmware: {self.hw_info.get('FW', 'Unknown')}")
         self.toggle_controls(True)
-        
-        # 2. Update Balance
+
         bal_l = results.get("bal_l", 0)
         bal_r = results.get("bal_r", 0)
         bal = bal_l if abs(bal_l) > abs(bal_r) else bal_r
@@ -1463,30 +1362,27 @@ class FluentDACController(FluentWindow):
         self.bal_slider.setValue(bal)
         self.bal_txt.setText(f"L {abs(bal)}" if bal < 0 else f"R {bal}" if bal > 0 else "Center")
 
-        # 3. Update Mic Gain
         if "mic_gain" in results:
             val = results["mic_gain"]
             self.mic_slider.setValue(val)
             self.mic_txt.setText(f"{val:+d} dB")
 
-        # 4. Update DAC Settings
         mapping = {0x11: (self.cb_filter, FILTER_MAP), 0x19: (self.cb_gain, GAIN_MAP), 0x1D: (self.cb_amp, AMP_MAP)}
         for cmd, (w, m) in mapping.items():
             if cmd in results: w.setCurrentText(m.get(results[cmd], "Unknown"))
         self.desc_filter.setText(self.filter_desc_map.get(self.cb_filter.currentText(), ""))
-            
-        # 5. PEQ Identity Logic (Now runs on every sync/reconnect)
+
         matched_idx = self._identify_preset(filters)
-        
+
         if matched_idx != -1:
             self.preset_cb.setCurrentIndex(matched_idx)
         else:
             none_idx = next((i for i, p in enumerate(self.settings_data["presets"]) if p["name"] == "None"), 0)
             none_p = self.settings_data["presets"][none_idx]
-            
+
             if CMD_GLOBAL_GAIN in results:
                 none_p["preamp"] = float(results[CMD_GLOBAL_GAIN])
-                
+
             for i in range(10):
                 if i in filters:
                     none_p["filters"][i].update({
@@ -1498,42 +1394,38 @@ class FluentDACController(FluentWindow):
                     })
             self.preset_cb.setCurrentIndex(none_idx)
 
-        # 6. Finalize UI 
         self._updating_ui = False
-        self._load_preset_ui() 
+        self._load_preset_ui()
         self._check_headroom(auto_level=False)
-        
+
         self.is_syncing = False
         self.refresh_status_lbl_dac.setText("")
 
     def _apply_filter(self, idx):
         if self.is_syncing: return
         self.dirty_usb_tasks.add(idx)
-        self.auto_flash_timer.start() 
+        self.auto_flash_timer.start()
         if not self.usb_timer.isActive():
             self.usb_timer.start()
 
     def _process_usb_queue(self):
-        """Processes EQ and Volume changes with corrected packet lengths"""
         if not self.dirty_usb_tasks or self.is_syncing:
             self.usb_timer.stop()
             return
-            
-        with self.usb_lock: 
+
+        with self.usb_lock:
             dev = self.get_device()
-            if not dev: 
+            if not dev:
                 self.dirty_usb_tasks.clear()
                 return
-                
+
             try:
-                report = dev.find_output_reports()[0]
                 tasks = list(self.dirty_usb_tasks)
                 self.dirty_usb_tasks.clear()
                 p = self.settings_data["presets"][self.preset_cb.currentIndex()]
-                
+
                 for idx in tasks:
                     if idx >= 0:
-                        # Standard EQ Filter Logic
                         f_data = p["filters"][idx]
                         g = 0.0 if not f_data.get("enabled", True) else float(f_data["gain"])
                         f, q, t = max(1, int(f_data["freq"])), max(0.01, float(f_data["q"])), f_data["type"]
@@ -1547,116 +1439,87 @@ class FluentDACController(FluentWindow):
                         hw_biquads = b"".join(struct.pack("<f", c/a0) for c in [b0, b1, b2, a1, a2])
                         pkt = [WRITE, CMD_PEQ_VALUES, 0x18, 0x00, idx, 0x00, 0x00] + list(hw_biquads)
                         pkt += list(struct.pack("<H", f)) + list(struct.pack("<H", int(q*256))) + list(struct.pack("<h", int(g*256))) + [TYPE_CODES.get(t, 0x02), 0x00, getattr(self, 'active_slot', 0x00), END]
-                        report.send([REPORT_ID] + pkt + ([0x00] * (63 - len(pkt))))
+
+                        final_pkt = [REPORT_ID] + pkt
+                        dev.write(final_pkt + [0x00] * (65 - len(final_pkt)))
                     else:
-                        # RESTORED: 3-byte volume payload (LSB, MSB, 0x00)
-                        # Length byte set to 0x03. This is the standard for live volume updates.
                         v_bytes = struct.pack("<h", int(self.last_raw_vol))
-                        report.send([REPORT_ID, WRITE, CMD_GLOBAL_GAIN, 0x03, v_bytes[0], v_bytes[1], 0x00] + ([0x00] * 57))
-                        
-                # AGGRESSIVE LATCH: Use 0xFF bitmask to force the DAC to apply all buffer changes
-                # This ensures the volume and EQ are both pushed to the hardware output stage instantly.
-                report.send([REPORT_ID, WRITE, CMD_TEMP_WRITE, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, END] + [0x00]*55)
-                
+                        vol_pkt = [REPORT_ID, WRITE, CMD_GLOBAL_GAIN, 0x03, v_bytes[0], v_bytes[1], 0x00]
+                        dev.write(vol_pkt + [0x00] * (65 - len(vol_pkt)))
+
+                latch_pkt = [REPORT_ID, WRITE, CMD_TEMP_WRITE, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, END]
+                dev.write(latch_pkt + [0x00] * (65 - len(latch_pkt)))
                 self.save_settings()
             except: pass
 
     def _commit_to_flash(self):
-        """Writes current latched state to permanent memory in the background"""
         if self.is_syncing: return
 
         def run_save():
             with self.usb_lock:
                 dev = self.get_device()
-                if not dev: return
-                try:
-                    report = dev.find_output_reports()[0]
-                    # CMD_FLASH_EQ (0x01) saves the Volume + EQ buffer permanently
-                    report.send([REPORT_ID, WRITE, CMD_FLASH_EQ, 0x01, END] + [0x00]*59)
-                    time.sleep(0.2) # Give the hardware a moment to process the physical write
-                except: pass
+                if dev:
+                    try:
+                        # Pad to EXACTLY 65 bytes (1 ID + 64 Data)
+                        dev.write([REPORT_ID, WRITE, CMD_FLASH_EQ, 0x01, END] + [0x00]*60)
+                    except: pass
+            time.sleep(0.2)
 
-        # Fire and forget in a background thread to keep the UI at 60fps
         Thread(target=run_save, daemon=True).start()
 
     def _on_balance_change(self):
         v = self.bal_slider.value()
         self.bal_txt.setText(f"L {abs(v)}" if v<0 else f"R {v}" if v>0 else "Center")
         if self.is_syncing: return
-        
+
         with self.usb_lock:
             dev = self.get_device()
             if dev:
                 try:
-                    report = dev.find_output_reports()[0]
-                    
-                    # 1. Calculate Magnitudes (0x00 clears the channel)
                     mag_l = 256 + v if v < 0 else 0x00
                     mag_r = 256 - v if v > 0 else 0x00
-                    
-                    # 2. Write Left Channel (Side Flag 0x01)
-                    report.send([REPORT_ID, 0x01, 0x16, 0x04, 0x01, 0x00, mag_l] + [0x00]*57)
-                    time.sleep(0.01) # Small delay so the DAC chips don't bottleneck
-                    
-                    # 3. Write Right Channel (Side Flag 0x00)
-                    report.send([REPORT_ID, 0x01, 0x16, 0x04, 0x00, 0x00, mag_r] + [0x00]*57)
-                    
+
+                    dev.write([REPORT_ID, 0x01, 0x16, 0x04, 0x01, 0x00, mag_l] + [0x00]*58)
+                    time.sleep(0.01)
+                    dev.write([REPORT_ID, 0x01, 0x16, 0x04, 0x00, 0x00, mag_r] + [0x00]*58)
+
                     self.save_settings()
                 except: pass
-            
+
     def _on_mic_gain_change(self, v):
         self.mic_txt.setText(f"{v:+d} dB")
         if self.is_syncing: return
-        self.auto_flash_timer.start() # Changed from auto_save_timer
+        self.auto_flash_timer.start()
         with self.usb_lock:
             dev = self.get_device()
             if dev:
                 try:
                     pkt = [REPORT_ID, WRITE, CMD_MIC_GAIN_ADDR, 0x02, 0x80, v & 0xFF] + ([0x00] * 58)
-                    dev.find_output_reports()[0].send(pkt)
+                    dev.write(pkt)
                 except: pass
 
     def _reset_eq(self):
         self._updating_ui = True
         p = self.settings_data["presets"][self.preset_cb.currentIndex()]
         p["preamp"] = 0.0
-        
-        # Apply preamp
+
         self._apply_filter(-1)
-        
-        # Reset all filters to flat
+
         for idx, f in enumerate(p["filters"]):
             f.update({"gain": 0.0, "enabled": True, "q": 1.0, "type": "PK"})
             self._apply_filter(idx)
-        
-        # Note: target_curve and measurement_curve are intentionally NOT cleared here.
-        
+
         self._updating_ui = False
         self._sync_all_uis()
 
-
     def _new_preset(self):
-        # Call the custom WinUI dialog we just created
         dialog = CustomInputDialog("Create New Preset", "Enter a unique name for your profile:", self)
 
         if dialog.exec():
             name = dialog.lineEdit.text().strip()
             if name:
-                # Prevent duplicate names
                 if any(p["name"] == name for p in self.settings_data["presets"]):
                     InfoBar.warning("Duplicate Name", f"Preset '{name}' already exists.", parent=self)
-                    return
-
-                df = [{"type": "PK", "freq": DEFAULT_FREQS[i], "q": 1.0, "gain": 0.0, "enabled": True, "lock_freq": False, "lock_gain": False, "lock_q": False} for i in range(10)]
-                self.settings_data["presets"].append({"name": name, "preamp": 0.0, "filters": df})
-                self.preset_cb.addItem(name)
-                self.preset_cb.setCurrentIndex(self.preset_cb.count() - 1)
-                self.save_settings()
-                InfoBar.success("Success", f"Preset '{name}' created.", parent=self)
-            if name:
-                # Check for duplicate names
-                if any(p["name"] == name for p in self.settings_data["presets"]):
-                    InfoBar.warning("Duplicate Name", f"A preset named '{name}' already exists.", parent=self)
                     return
 
                 df = [{"type": "PK", "freq": DEFAULT_FREQS[i], "q": 1.0, "gain": 0.0, "enabled": True, "lock_freq": False, "lock_gain": False, "lock_q": False} for i in range(10)]
@@ -1676,7 +1539,7 @@ class FluentDACController(FluentWindow):
             for line in lines:
                 if "Preamp:" in line:
                     m = re.search(r"Preamp:\s*([-+]?[\d.]+)", line)
-                    if m: 
+                    if m:
                         val = float(m.group(1))
                         p["preamp"] = max(-16.0, min(6.0, val))
                 if "Filter" in line and idx < 10:
@@ -1684,13 +1547,8 @@ class FluentDACController(FluentWindow):
                     f_data["enabled"] = "ON" in line
                     f_data["type"] = "PK" if " PK " in line else "LS" if " LS " in line else "HS"
                     fc, gn, qv = re.search(r"Fc\s+([\d.]+)", line), re.search(r"Gain\s+([-+.\d]+)", line), re.search(r"Q\s+([\d.]+)", line)
-                    # Frequency: Clamp between 20Hz and 20,000Hz
                     if fc: f_data["freq"] = max(20, min(20000, float(fc.group(1))))
-                    
-                    # Gain: Clamp between -10dB and +10dB
                     if gn: f_data["gain"] = max(-10.0, min(10.0, float(gn.group(1))))
-                    
-                    # Q Factor: Use the value from the file, with a minimum of 0.1
                     if qv: f_data["q"] = max(0.1, float(qv.group(1)))
                     idx += 1
             for i in range(10): self._apply_filter(i)
@@ -1698,15 +1556,15 @@ class FluentDACController(FluentWindow):
             self.save_settings()
             InfoBar.success("Import", "AutoEQ settings applied and saved.", parent=self)
         except: pass
-        
+
     def _export_autoeq(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export AutoEQ File", "Custom_AutoEQ.txt", "Text Files (*.txt);;All Files (*)")
         if not path: return
-        
+
         try:
             p = self.settings_data["presets"][self.preset_cb.currentIndex()]
             lines = [f"Preamp: {p.get('preamp', 0.0):.1f} dB\n"]
-            
+
             for i, f in enumerate(p["filters"]):
                 state = "ON" if f.get("enabled", True) else "OFF"
                 t = f.get("type", "PK")
@@ -1714,35 +1572,30 @@ class FluentDACController(FluentWindow):
                 g = f.get("gain", 0.0)
                 q = f.get("q", 1.0)
                 lines.append(f"Filter {i+1}: {state} {t} Fc {fc:.1f} Hz Gain {g:.1f} dB Q {q:.2f}\n")
-                
+
             with open(path, 'w') as file:
                 file.writelines(lines)
-                
+
             InfoBar.success("Success", f"Preset exported to {os.path.basename(path)}", parent=self)
         except Exception as e:
             InfoBar.error("Export Error", str(e), parent=self)
 
     def _load_preset_ui(self):
-        """
-        Triggered when the preset dropdown changes. 
-        Updates the UI elements, then explicitly flags all bands 
-        and global volume to be transmitted to the hardware.
-        """
         self._sync_all_uis()
         if self.is_syncing:
-            return          
+            return
         self._apply_filter(-1)
         for i in range(10):
             self._apply_filter(i)
 
     def write_val(self, cmd, selection, n_map):
         inv = {v: k for k, v in n_map.items()}
-        self.auto_flash_timer.start() # Changed from auto_save_timer
+        self.auto_flash_timer.start()
         with self.usb_lock:
             dev = self.get_device()
             if dev:
                 try:
-                    dev.find_output_reports()[0].send([REPORT_ID, WRITE, cmd, 0x01, inv.get(selection)] + [0x00]*59)
+                    dev.write([REPORT_ID, WRITE, cmd, 0x01, inv.get(selection)] + [0x00]*59)
                 except: pass
 
     def save_settings(self):
@@ -1758,9 +1611,9 @@ if __name__ == "__main__":
         pass
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path("icon.ico")))
-    
-    setTheme(Theme.AUTO) 
-    
+
+    setTheme(Theme.AUTO)
+
     window = FluentDACController()
     window.show()
     sys.exit(app.exec())

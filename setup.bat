@@ -8,7 +8,7 @@ virtualenv venv
 echo Activating environment and installing modules...
 call venv\Scripts\activate
 python -m pip install --upgrade pip
-pip install pywinusb PySide6 PySide6-Fluent-Widgets pyinstaller
+pip install -r requirements.txt
 
 echo.
 echo Setup complete!
