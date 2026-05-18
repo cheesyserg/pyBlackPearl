@@ -14,4 +14,4 @@ dist/
 *.spec
 
 # add settings.json
-#settings.json
+Settings.json
