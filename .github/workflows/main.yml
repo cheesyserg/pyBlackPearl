@@ -1,10 +1,7 @@
 name: Build PyInstaller Executables
 
 on:
-  push:
-    branches: [ unify_testBuild ]
-  release:
-    types: [ created ]
+  workflow_dispatch: # Only runs when you click the button manually
 
 jobs:
   build:
