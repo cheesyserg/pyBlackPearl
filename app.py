@@ -2205,10 +2205,18 @@ if __name__ == "__main__":
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except Exception:
         pass
+
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path("icon.ico")))
 
-    setTheme(Theme.AUTO)
+    # ---- UPDATE THIS SECTION ----
+    # Pre-detect system theme state so qfluentwidgets matches seamlessly
+    if hasattr(app.styleHints(), "colorScheme"):
+        is_dark = app.styleHints().colorScheme() == Qt.ColorScheme.Dark
+        setTheme(Theme.DARK if is_dark else Theme.LIGHT)
+    else:
+        setTheme(Theme.AUTO)
+    # -----------------------------
 
     window = FluentDACController()
     window.show()
